@@ -16,7 +16,7 @@ pub(crate) mod nuget;
 pub(crate) mod pub_dart;
 mod pypi;
 pub(crate) mod range;
-mod raw;
+pub(crate) mod raw;
 pub(crate) mod rpm;
 pub(crate) mod terraform;
 
@@ -51,16 +51,45 @@ pub(crate) use raw::storage_key as raw_storage_key;
 pub use rpm::routes as rpm_routes;
 pub use terraform::routes as terraform_routes;
 
-use crate::circuit_breaker::CircuitBreakerRegistry;
-use crate::config::basic_auth_header;
+use crate::circuit_breaker::{BreakerScope, CircuitBreakerRegistry};
+use crate::config::UpstreamAuth;
 use crate::metrics::{UPSTREAM_POLICY_BLOCKED_TOTAL, UPSTREAM_REQUEST_DURATION};
-use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::body::{Body, Bytes};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use std::time::{Duration, Instant};
+
+/// Remove the files directly in `dir` whose last write is at least `max_age` ago.
+///
+/// For the dedicated temp directories of streamed uploads and proxy fetches: a
+/// transfer in progress keeps writing its file, so it never gets that old, while a
+/// file orphaned by a crash (SIGKILL, OOM) or a failed commit stops changing and is
+/// reaped. A missing directory is not an error. Returns how many files were removed.
+pub(crate) fn remove_stale_temp_files(dir: &std::path::Path, max_age: Duration) -> u64 {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "Failed to read temp directory for cleanup");
+            return 0;
+        }
+    };
+    let mut removed = 0u64;
+    for entry in entries.flatten() {
+        let is_stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if is_stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
 
 /// 405 Method Not Allowed with `Allow` header (RFC 9110 §15.5.6).
 pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
@@ -176,6 +205,88 @@ pub(crate) enum ProxyError {
     CircuitOpen(String),
 }
 
+/// The `Authorization` value for an upstream request, built before the breaker is
+/// consulted: a credential that cannot be a header is a configuration fault, not an
+/// upstream outage, so it must neither reach the wire nor count toward opening the
+/// breaker. Config loading rejects such tokens first (#1055); this is the backstop.
+fn upstream_auth_header(
+    auth: Option<UpstreamAuth<'_>>,
+) -> Result<Option<reqwest::header::HeaderValue>, ProxyError> {
+    auth.map(UpstreamAuth::header_value)
+        .transpose()
+        // `InvalidHeaderValue` displays a fixed text, never the header bytes — the
+        // token cannot leak into the error (http 1.5 `header/value.rs`).
+        .map_err(|e| ProxyError::Network(format!("upstream credential rejected: {e}")))
+}
+
+/// What the upstreams of a cold miss said, to answer it once every upstream was asked. A
+/// miss is "not found" only when an upstream said so; when every upstream failed (5xx after
+/// the retry, unreachable, breaker open) it is a gateway failure: a client that records a
+/// 404 as "this artifact does not exist" (Maven) must not learn that from an outage.
+/// One upstream answering "not found" decides 404 while another failed, as a group
+/// repository skips a member that is down; with no upstream configured it is 404.
+#[derive(Debug, Default)]
+pub(crate) struct UpstreamMiss {
+    not_found: bool,
+    failed: bool,
+}
+
+impl UpstreamMiss {
+    /// The miss of a format with a single upstream, from its one answer.
+    pub(crate) fn of(e: &ProxyError) -> Self {
+        let mut miss = Self::default();
+        miss.record(e);
+        miss
+    }
+
+    /// Record one upstream's answer. Any 4xx is an answer, even where a fetch reports it as
+    /// `Upstream(4xx)` rather than `NotFound` (Docker manifests); 5xx, network errors and an
+    /// open breaker are failures.
+    pub(crate) fn record(&mut self, e: &ProxyError) {
+        match e {
+            ProxyError::NotFound => self.not_found = true,
+            ProxyError::Upstream(code) if (400..500).contains(code) => self.not_found = true,
+            ProxyError::Upstream(_) | ProxyError::Network(_) | ProxyError::CircuitOpen(_) => {
+                self.failed = true
+            }
+        }
+    }
+
+    /// Record an upstream that answered without the artifact (a listing that does not name it).
+    pub(crate) fn answered(&mut self) {
+        self.not_found = true;
+    }
+
+    /// Fold in one upstream that was asked under several names (Docker's `library/` fallback
+    /// asks it for `alpine` and `library/alpine`): it said "not found" only if it failed
+    /// under none of them, since a 4xx for one name says nothing about the other.
+    pub(crate) fn record_upstream(&mut self, asked: &UpstreamMiss) {
+        if asked.failed {
+            self.failed = true;
+        } else if asked.not_found {
+            self.not_found = true;
+        }
+    }
+
+    /// The status for the miss: 502 when upstreams were asked and every one failed.
+    pub(crate) fn status(&self) -> StatusCode {
+        if self.failed && !self.not_found {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::NOT_FOUND
+        }
+    }
+
+    /// The response for the miss, logging a gateway failure for the operator.
+    pub(crate) fn response(&self, registry: &str, path: &str) -> Response {
+        let status = self.status();
+        if status == StatusCode::BAD_GATEWAY {
+            tracing::warn!(registry, path, "every upstream failed, returning 502");
+        }
+        status.into_response()
+    }
+}
+
 /// 503 response for circuit breaker open state with Retry-After header.
 pub(crate) fn circuit_open_response(registry: &str) -> Response {
     (
@@ -208,23 +319,26 @@ async fn proxy_fetch_core<T, F, Fut>(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     extra_headers: Option<(&str, &str)>,
     extract: F,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<T, ProxyError>
 where
     F: Fn(reqwest::Response) -> Fut + Copy,
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
 {
-    let registry_str = registry.as_str();
-    let probe = cb.check(registry_str)?;
+    let auth_header = upstream_auth_header(auth)?;
+    let scope = scope.into();
+    let registry_str = scope.registry().as_str();
+    let cb_key = scope.key();
+    let probe = cb.check(&cb_key)?;
 
     for attempt in 0..2 {
         let mut request = client.get(url).timeout(timeout);
-        if let Some(credentials) = auth {
-            request = request.header("Authorization", basic_auth_header(credentials));
+        if let Some(value) = &auth_header {
+            request = request.header(header::AUTHORIZATION, value.clone());
         }
         if let Some((key, val)) = extra_headers {
             request = request.header(key, val);
@@ -242,11 +356,11 @@ where
                         .await
                         .map_err(|e| ProxyError::Network(e.to_string()));
                     if result.is_ok() {
-                        cb.record_success(registry_str, probe);
+                        cb.record_success(&cb_key, probe);
                     } else {
                         // 2xx but the body could not be read (e.g. a mid-stream
                         // drop) — treat as a fetch failure for the breaker.
-                        cb.record_failure(registry_str, probe);
+                        cb.record_failure(&cb_key, probe);
                     }
                     return result;
                 }
@@ -278,7 +392,7 @@ where
                     // from HalfOpen (so it recovers instead of slow-probing) but
                     // is a no-op in Closed, so a 4xx never clears a real failure
                     // tally (#606).
-                    cb.record_alive(registry_str, probe);
+                    cb.record_alive(&cb_key, probe);
                     return Err(ProxyError::NotFound);
                 }
                 if attempt == 0 {
@@ -292,7 +406,7 @@ where
                 UPSTREAM_REQUEST_DURATION
                     .with_label_values(&[registry_str, "5xx"])
                     .observe(elapsed);
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Upstream(status));
             }
             Err(e) => {
@@ -306,12 +420,12 @@ where
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Network(e.to_string()));
             }
         }
     }
-    cb.record_failure(registry_str, probe);
+    cb.record_failure(&cb_key, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
 }
 
@@ -320,9 +434,9 @@ pub(crate) async fn proxy_fetch(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Vec<u8>, ProxyError> {
     proxy_fetch_core(
         client,
@@ -332,7 +446,7 @@ pub(crate) async fn proxy_fetch(
         None,
         |r| async { r.bytes().await.map(|b| b.to_vec()) },
         cb,
-        registry,
+        scope,
     )
     .await
 }
@@ -342,10 +456,10 @@ pub(crate) async fn proxy_fetch_text(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     extra_headers: Option<(&str, &str)>,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<String, ProxyError> {
     proxy_fetch_core(
         client,
@@ -355,7 +469,7 @@ pub(crate) async fn proxy_fetch_text(
         extra_headers,
         |r| r.text(),
         cb,
-        registry,
+        scope,
     )
     .await
 }
@@ -375,7 +489,7 @@ pub(crate) async fn repo_proxy_download(
     display: String,
     key: String,
     url: String,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     timeout_secs: u64,
     metadata_ttl: i64,
     immutable: bool,
@@ -532,7 +646,7 @@ pub(crate) async fn repo_proxy_download(
 /// as-is — including a 4xx (a real audit response, upstream is alive) — with only
 /// 5xx / network / circuit-open surfaced as `ProxyError`.
 ///
-/// `auth` is the configured proxy credential (Basic); the caller's own
+/// `auth` is the configured proxy credential (Basic or Bearer); the caller's own
 /// `Authorization` is never forwarded — pass only the intended headers in
 /// `fwd_headers` (allowlist). The body is not inspected or decompressed here.
 #[allow(clippy::too_many_arguments)]
@@ -540,19 +654,22 @@ pub(crate) async fn proxy_forward_post(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     fwd_headers: &[(&str, &str)],
     body: &[u8],
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<(u16, Vec<u8>, Option<String>), ProxyError> {
-    let registry_str = registry.as_str();
-    let probe = cb.check(registry_str)?;
+    let auth_header = upstream_auth_header(auth)?;
+    let scope = scope.into();
+    let registry_str = scope.registry().as_str();
+    let cb_key = scope.key();
+    let probe = cb.check(&cb_key)?;
 
     for attempt in 0..2 {
         let mut request = client.post(url).timeout(timeout).body(body.to_vec());
-        if let Some(credentials) = auth {
-            request = request.header("Authorization", basic_auth_header(credentials));
+        if let Some(value) = &auth_header {
+            request = request.header(header::AUTHORIZATION, value.clone());
         }
         for (k, v) in fwd_headers {
             request = request.header(*k, *v);
@@ -574,11 +691,11 @@ pub(crate) async fn proxy_forward_post(
                         .observe(elapsed);
                     match response.bytes().await {
                         Ok(b) => {
-                            cb.record_success(registry_str, probe);
+                            cb.record_success(&cb_key, probe);
                             return Ok((code, b.to_vec(), content_type));
                         }
                         Err(e) => {
-                            cb.record_failure(registry_str, probe);
+                            cb.record_failure(&cb_key, probe);
                             return Err(ProxyError::Network(e.to_string()));
                         }
                     }
@@ -589,7 +706,7 @@ pub(crate) async fn proxy_forward_post(
                         .observe(elapsed);
                     // Upstream is alive and answered — a 4xx audit response is a real
                     // answer, forward it verbatim (not an availability failure). #606.
-                    cb.record_alive(registry_str, probe);
+                    cb.record_alive(&cb_key, probe);
                     let b = response
                         .bytes()
                         .await
@@ -605,7 +722,7 @@ pub(crate) async fn proxy_forward_post(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Upstream(code));
             }
             Err(e) => {
@@ -619,12 +736,12 @@ pub(crate) async fn proxy_forward_post(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Network(e.to_string()));
             }
         }
     }
-    cb.record_failure(registry_str, probe);
+    cb.record_failure(&cb_key, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
 }
 
@@ -819,24 +936,26 @@ fn header_string(resp: &reqwest::Response, name: reqwest::header::HeaderName) ->
 /// conditional headers, so it always yields `Modified` — that is how the full
 /// fetch path captures validators for the first time.
 ///
-/// Circuit breaker: 304/200 record success; transport/5xx record failure; 4xx
-/// returns `NotFound` (matching `proxy_fetch_core`). No retry — revalidation is
-/// a lightweight check and the caller falls back to a full fetch on error.
+/// Circuit breaker: 304/200 record success; transport/5xx and a 200 whose body
+/// cannot be read record failure; 4xx returns `NotFound` (matching
+/// `proxy_fetch_core`). No retry — revalidation is a lightweight check and the
+/// caller falls back to a full fetch on error.
 pub(crate) async fn proxy_fetch_conditional(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     validators: &Validators,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
-    let registry_str = registry.as_str();
-    let probe = cb.check(registry_str)?;
+    let auth_header = upstream_auth_header(auth)?;
+    let cb_key = scope.into().key();
+    let probe = cb.check(&cb_key)?;
 
     let mut request = client.get(url).timeout(timeout);
-    if let Some(credentials) = auth {
-        request = request.header(header::AUTHORIZATION, basic_auth_header(credentials));
+    if let Some(value) = auth_header {
+        request = request.header(header::AUTHORIZATION, value);
     }
     if let Some(ref etag) = validators.etag {
         request = request.header(header::IF_NONE_MATCH, etag);
@@ -849,7 +968,7 @@ pub(crate) async fn proxy_fetch_conditional(
         Ok(response) => {
             let status = response.status();
             if status == reqwest::StatusCode::NOT_MODIFIED {
-                cb.record_success(registry_str, probe);
+                cb.record_success(&cb_key, probe);
                 return Ok(Revalidation::NotModified);
             }
             if status.is_success() {
@@ -857,28 +976,36 @@ pub(crate) async fn proxy_fetch_conditional(
                     etag: header_string(&response, header::ETAG),
                     last_modified: header_string(&response, header::LAST_MODIFIED),
                 };
-                let body = response
-                    .bytes()
-                    .await
-                    .map_err(|e| ProxyError::Network(e.to_string()))?;
-                cb.record_success(registry_str, probe);
-                return Ok(Revalidation::Modified {
-                    body: body.to_vec(),
-                    validators: new_validators,
-                });
+                return match response.bytes().await {
+                    Ok(body) => {
+                        cb.record_success(&cb_key, probe);
+                        Ok(Revalidation::Modified {
+                            body: body.to_vec(),
+                            validators: new_validators,
+                        })
+                    }
+                    Err(e) => {
+                        // 2xx but the body could not be read (e.g. a mid-stream
+                        // drop) — a fetch failure for the breaker, as in
+                        // proxy_fetch_core; unreported, a half-open probe would
+                        // hold its slot until the #585 stall recovery.
+                        cb.record_failure(&cb_key, probe);
+                        Err(ProxyError::Network(e.to_string()))
+                    }
+                };
             }
             let code = status.as_u16();
             if (400..500).contains(&code) {
                 // 4xx — upstream alive; recover the breaker without clearing a
                 // real failure tally, consistent with proxy_fetch_core (#606).
-                cb.record_alive(registry_str, probe);
+                cb.record_alive(&cb_key, probe);
                 return Err(ProxyError::NotFound);
             }
-            cb.record_failure(registry_str, probe);
+            cb.record_failure(&cb_key, probe);
             Err(ProxyError::Upstream(code))
         }
         Err(e) => {
-            cb.record_failure(registry_str, probe);
+            cb.record_failure(&cb_key, probe);
             Err(ProxyError::Network(e.to_string()))
         }
     }
@@ -887,6 +1014,66 @@ pub(crate) async fn proxy_fetch_conditional(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry_type::RegistryType;
+
+    /// 404 only when an upstream said "not found"; 502 when upstreams were asked and every
+    /// one failed; 404 with no upstream at all.
+    #[test]
+    fn a_miss_is_not_found_only_when_an_upstream_said_so() {
+        use axum::http::StatusCode;
+        let miss = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m.status()
+        };
+        let down = || ProxyError::Upstream(503);
+        let unreachable = || ProxyError::Network("refused".into());
+        let open = || ProxyError::CircuitOpen("maven".into());
+        assert_eq!(miss(&[]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::NotFound]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::Upstream(401)]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::Upstream(499)]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::Upstream(500)]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[ProxyError::Upstream(399)]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[down()]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[unreachable()]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[open()]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[down(), unreachable()]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[down(), ProxyError::NotFound]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::NotFound, down()]), StatusCode::NOT_FOUND);
+
+        // One upstream asked under two names: not found under one and failed under the
+        // other is a failed upstream; another upstream's "not found" still decides 404.
+        let asked = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m
+        };
+        let folded = |upstreams: &[UpstreamMiss]| {
+            let mut m = UpstreamMiss::default();
+            for u in upstreams {
+                m.record_upstream(u);
+            }
+            m.status()
+        };
+        let hub = asked(&[ProxyError::NotFound, down()]);
+        let gone = asked(&[ProxyError::NotFound, ProxyError::NotFound]);
+        assert_eq!(folded(&[]), StatusCode::NOT_FOUND);
+        assert_eq!(folded(&[asked(&[])]), StatusCode::NOT_FOUND);
+        assert_eq!(
+            folded(&[asked(&[ProxyError::NotFound, down()])]),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(folded(&[gone]), StatusCode::NOT_FOUND);
+        assert_eq!(
+            folded(&[hub, asked(&[ProxyError::NotFound])]),
+            StatusCode::NOT_FOUND
+        );
+    }
 
     #[tokio::test]
     async fn test_proxy_fetch_invalid_url() {
@@ -1070,6 +1257,237 @@ mod tests {
         assert!(matches!(out, Revalidation::NotModified));
     }
 
+    /// Run one half-open probe through `proxy_fetch_conditional` against an
+    /// upstream that answers with a 200 declaring `declared_len` bytes, writes
+    /// `body`, and hangs up — with `declared_len > body.len()` the body breaks off
+    /// mid-stream. The breaker (threshold 1, reset 1 h, so the #585 stall
+    /// recovery cannot release the slot during the test) is tripped and its open
+    /// timer backdated first, so the call IS the probe.
+    async fn conditional_half_open_probe(
+        cb: &CircuitBreakerRegistry,
+        declared_len: usize,
+        body: &[u8],
+    ) -> Result<Revalidation, ProxyError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let serve_once = async {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {declared_len}\r\nconnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body).await;
+            let _ = sock.shutdown().await;
+        };
+
+        cb.record_failure("npm", crate::circuit_breaker::ProbeToken::BACKGROUND);
+        cb.expire_open_for_test("npm");
+        let client = reqwest::Client::new();
+        let validators = Validators::default();
+        let fetch = proxy_fetch_conditional(
+            &client,
+            &upstream,
+            Duration::from_secs(5),
+            None,
+            &validators,
+            cb,
+            RegistryType::Npm,
+        );
+        let ((), out) = tokio::join!(serve_once, fetch);
+        out
+    }
+
+    fn half_open_test_cb() -> CircuitBreakerRegistry {
+        CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold: 1,
+            reset_timeout: 3600,
+            overrides: std::collections::HashMap::new(),
+        })
+    }
+
+    /// A half-open probe that gets a 200 whose body breaks off must report back
+    /// as a failure, exactly like `proxy_fetch_core` ("2xx but the body could not
+    /// be read"). Unreported, the probe slot stays held, and every request is
+    /// rejected with CircuitOpen until the #585 stall recovery (reset_timeout)
+    /// gives up on it.
+    #[tokio::test]
+    async fn conditional_truncated_200_returns_the_probe_as_a_failure() {
+        let cb = half_open_test_cb();
+
+        match conditional_half_open_probe(&cb, 64, b"only-part-of-the-body").await {
+            Err(ProxyError::Network(_)) => {}
+            Err(e) => panic!("a broken-off body is a network error, got {e:?}"),
+            Ok(_) => panic!("a broken-off body must not be returned as a revalidation"),
+        }
+
+        // The breaker counted the failed probe: back to Open, not stuck HalfOpen.
+        let health = cb.health_snapshot("npm").expect("breaker recorded");
+        assert_eq!(
+            health.status, "open",
+            "the failed probe must re-open the breaker"
+        );
+
+        // The probe slot came back: once the open timer runs out, a new probe is
+        // granted. A probe that never reported keeps the slot and this check is
+        // CircuitOpen for the whole reset_timeout.
+        cb.expire_open_for_test("npm");
+        assert!(
+            cb.check("npm").is_ok(),
+            "the probe slot must be released, not held by the lost probe"
+        );
+    }
+
+    /// Control for the harness above: the same raw upstream with a complete body
+    /// is a successful probe that closes the breaker, so the failure above comes
+    /// from the broken-off body and not from the harness.
+    #[tokio::test]
+    async fn conditional_complete_200_closes_the_half_open_breaker() {
+        let body: &[u8] = b"the-whole-body";
+        let cb = half_open_test_cb();
+
+        match conditional_half_open_probe(&cb, body.len(), body).await {
+            Ok(Revalidation::Modified { body: got, .. }) => assert_eq!(got, body),
+            Ok(Revalidation::NotModified) => panic!("expected Modified, got NotModified"),
+            Err(e) => panic!("expected Modified, got {e:?}"),
+        }
+        assert_eq!(cb.health_snapshot("npm").unwrap().status, "closed");
+    }
+
+    /// Every shared upstream helper sends the credential with its own scheme (#1055).
+    /// The mock answers only when the exact `Authorization` value arrives, so each
+    /// `Ok` proves the header went out as `Bearer <token>` / `Basic <b64>` — a helper
+    /// that dropped the header or forced Basic would get a 404 instead.
+    #[tokio::test]
+    async fn every_upstream_helper_sends_the_configured_scheme() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (auth, expected) in [
+            (UpstreamAuth::Bearer("npm_tok-1"), "Bearer npm_tok-1"),
+            (UpstreamAuth::Basic("user:pass"), "Basic dXNlcjpwYXNz"),
+        ] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(header("authorization", expected))
+                .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+                .mount(&upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(header("authorization", expected))
+                .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+                .mount(&upstream)
+                .await;
+            let client = reqwest::Client::new();
+            let cb = noop_cb();
+            let url = upstream.uri();
+            let t = Duration::from_secs(5);
+
+            let bytes = proxy_fetch(&client, &url, t, Some(auth), &cb, RegistryType::Npm).await;
+            assert_eq!(bytes.unwrap(), b"ok", "proxy_fetch with {expected}");
+
+            let text =
+                proxy_fetch_text(&client, &url, t, Some(auth), None, &cb, RegistryType::Npm).await;
+            assert_eq!(text.unwrap(), "ok", "proxy_fetch_text with {expected}");
+
+            let cond = proxy_fetch_conditional(
+                &client,
+                &url,
+                t,
+                Some(auth),
+                &Validators::default(),
+                &cb,
+                RegistryType::Npm,
+            )
+            .await;
+            assert!(
+                matches!(cond, Ok(Revalidation::Modified { .. })),
+                "proxy_fetch_conditional with {expected}"
+            );
+
+            let post = proxy_forward_post(
+                &client,
+                &url,
+                t,
+                Some(auth),
+                &[],
+                b"{}",
+                &cb,
+                RegistryType::Npm,
+            )
+            .await;
+            assert_eq!(post.unwrap().0, 200, "proxy_forward_post with {expected}");
+        }
+    }
+
+    /// A credential that cannot be a header never reaches the wire and is not an
+    /// upstream outage: with a breaker that opens on the first failure, repeated
+    /// bad-credential calls leave it closed. Control: one real network failure under
+    /// the same config does open it, so the config is live and the test not vacuous.
+    #[tokio::test]
+    async fn invalid_credential_neither_sent_nor_counted_by_breaker() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&upstream)
+            .await;
+        let client = reqwest::Client::new();
+        let t = Duration::from_secs(5);
+        let strict = || {
+            CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig {
+                enabled: true,
+                failure_threshold: 1,
+                reset_timeout: 300,
+                overrides: Default::default(),
+            })
+        };
+
+        let cb = strict();
+        for _ in 0..3 {
+            let bad = proxy_fetch(
+                &client,
+                &upstream.uri(),
+                t,
+                Some(UpstreamAuth::Bearer("tok\n")),
+                &cb,
+                RegistryType::Npm,
+            )
+            .await;
+            assert!(matches!(bad, Err(ProxyError::Network(_))));
+        }
+        let requests = upstream.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "a bad credential must not reach the upstream"
+        );
+        let good = proxy_fetch(&client, &upstream.uri(), t, None, &cb, RegistryType::Npm).await;
+        assert_eq!(good.unwrap(), b"ok", "breaker must still be closed");
+
+        // Control: a genuine transport failure opens the same strict breaker.
+        let cb = strict();
+        let refused = proxy_fetch(
+            &client,
+            "http://127.0.0.1:1/x",
+            t,
+            None,
+            &cb,
+            RegistryType::Npm,
+        )
+        .await;
+        assert!(matches!(refused, Err(ProxyError::Network(_))));
+        let after = proxy_fetch(&client, &upstream.uri(), t, None, &cb, RegistryType::Npm).await;
+        assert!(
+            matches!(after, Err(ProxyError::CircuitOpen(_))),
+            "control: breaker opens"
+        );
+    }
+
     /// Validators round-trip through storage (the sidecar lives on disk, so they
     /// survive a restart) — acceptance criterion for #596.
     #[tokio::test]
@@ -1103,5 +1521,248 @@ mod tests {
         assert!(read_validators(&storage, "npm/x/metadata.json")
             .await
             .is_none());
+    }
+
+    /// What the router hands a handler for paths with empty segments (axum 0.8 / matchit 0.8):
+    /// a `{param}` followed by a literal `/` matches an EMPTY segment; `Path` percent-decodes,
+    /// so `%2F` puts `/` inside a single `{param}`; `{*rest}` keeps `//`, a leading `/` and a
+    /// trailing `/`; nothing normalizes. Every handler must refuse such names itself.
+    #[tokio::test]
+    async fn the_router_hands_empty_segments_to_handlers_as_sent() {
+        use crate::test_helpers::{body_bytes, send};
+        use axum::extract::Path;
+        use axum::http::{Method, StatusCode};
+        use axum::routing::get;
+
+        async fn one(Path(p): Path<String>) -> String {
+            format!("[{p}]")
+        }
+        async fn two(Path((a, b)): Path<(String, String)>) -> String {
+            format!("[{a}][{b}]")
+        }
+        let app: axum::Router = axum::Router::new()
+            .route("/simple/{name}/", get(one))
+            .route("/simple/{name}/{filename}", get(two))
+            .route("/gems/info/{name}", get(one))
+            .route("/w/{*path}", get(one))
+            .route("/r/{repo}/{*path}", get(two));
+        let cases = [
+            ("/simple//", Some("[]")),
+            ("/simple//x", Some("[][x]")),
+            ("/simple/foo%2F/", Some("[foo/]")),
+            ("/simple/%2Ffoo/x", Some("[/foo][x]")),
+            ("/gems/info/", None),
+            ("/gems/info/x%2F%2Fy", Some("[x//y]")),
+            ("/w/a//b", Some("[a//b]")),
+            ("/w//a", Some("[/a]")),
+            ("/w/a/b/", Some("[a/b/]")),
+            ("/w/a%2F%2Fb", Some("[a//b]")),
+            ("/r//x", Some("[][x]")),
+            ("/r/a//b", Some("[a][/b]")),
+        ];
+        for (uri, want) in cases {
+            let resp = send(&app, Method::GET, uri, axum::body::Body::empty()).await;
+            match want {
+                Some(body) => {
+                    assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                    assert_eq!(&body_bytes(resp).await[..], body.as_bytes(), "{uri}");
+                }
+                None => assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}"),
+            }
+        }
+    }
+}
+
+/// The upstream-failure class as one table: every proxied cold-miss path of Maven, Docker,
+/// Cargo, PyPI and Terraform, against every shape an upstream can answer in, alone and mixed
+/// with another upstream. The expected status is the invariant itself: 404 when an upstream
+/// answered 4xx ("not found"), 502 when every upstream failed — 5xx, refused, timed out.
+#[cfg(test)]
+mod upstream_failure_matrix {
+    #![allow(clippy::unwrap_used)]
+
+    use crate::config::{Config, DockerUpstream, MavenProxyEntry};
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use std::time::Duration;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// How one upstream answers every request.
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        Status(u16),
+        Refused,
+        /// Answers after the 1 s proxy timeout every case configures.
+        Timeout,
+    }
+
+    /// The status a cold miss must get from upstreams answering in `shapes`.
+    fn expected(shapes: &[Shape]) -> StatusCode {
+        if shapes
+            .iter()
+            .any(|s| matches!(s, Shape::Status(code) if (400..500).contains(code)))
+        {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_GATEWAY
+        }
+    }
+
+    /// An upstream answering in `shape`; the server is returned so it lives as long as the case.
+    async fn upstream(shape: Shape) -> (String, Option<MockServer>) {
+        let template = match shape {
+            Shape::Refused => return ("http://127.0.0.1:9".to_string(), None),
+            Shape::Status(code) => ResponseTemplate::new(code),
+            Shape::Timeout => ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        (server.uri(), Some(server))
+    }
+
+    const ALONE: &[&[Shape]] = &[
+        &[Shape::Status(503)],
+        &[Shape::Refused],
+        &[Shape::Timeout],
+        &[Shape::Status(400)],
+        &[Shape::Status(404)],
+    ];
+
+    const MIXED: &[&[Shape]] = &[
+        &[Shape::Status(503), Shape::Status(404)],
+        &[Shape::Status(404), Shape::Status(503)],
+        &[Shape::Timeout, Shape::Status(404)],
+        &[Shape::Status(400), Shape::Refused],
+        &[Shape::Status(503), Shape::Refused],
+        &[Shape::Refused, Shape::Timeout],
+    ];
+
+    /// Runs every case for one path; `configure` points the format at the upstream URLs (in
+    /// order) with a 1 s proxy timeout. One test per path, so the timed-out cases run side by side.
+    async fn run(path: &str, configure: fn(&mut Config, Vec<String>), several: bool) {
+        let mut cases: Vec<&[Shape]> = ALONE.to_vec();
+        if several {
+            cases.extend_from_slice(MIXED);
+        }
+        for shapes in cases {
+            let mut urls = Vec::new();
+            let mut servers = Vec::new();
+            for shape in shapes {
+                let (url, server) = upstream(*shape).await;
+                urls.push(url);
+                servers.push(server);
+            }
+            let ctx = create_test_context_with_config(move |cfg| configure(cfg, urls));
+            let resp = send(&ctx.app, Method::GET, path, Body::empty()).await;
+            assert_eq!(resp.status(), expected(shapes), "{path} {shapes:?}");
+            drop(servers);
+        }
+    }
+
+    fn maven(cfg: &mut Config, urls: Vec<String>) {
+        cfg.maven.proxies = urls.into_iter().map(MavenProxyEntry::Simple).collect();
+        cfg.maven.proxy_timeout = 1;
+    }
+
+    fn docker(cfg: &mut Config, urls: Vec<String>) {
+        cfg.docker.upstreams = urls
+            .into_iter()
+            .map(|url| DockerUpstream {
+                url,
+                auth: None,
+                namespace: None,
+                prefix: None,
+            })
+            .collect();
+        cfg.docker.proxy_timeout = 1;
+    }
+
+    fn cargo(cfg: &mut Config, urls: Vec<String>) {
+        cfg.cargo.proxy = urls.into_iter().next();
+        cfg.cargo.proxy_timeout = 1;
+    }
+
+    fn pypi(cfg: &mut Config, urls: Vec<String>) {
+        // Plain URL entries, as `proxies = ["https://..."]` reads from the config file.
+        cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+        cfg.pypi.proxy_timeout = 1;
+    }
+
+    fn terraform(cfg: &mut Config, urls: Vec<String>) {
+        cfg.terraform.enabled = true;
+        cfg.terraform.proxy = urls.into_iter().next();
+        cfg.terraform.proxy_timeout = 1;
+    }
+
+    #[tokio::test]
+    async fn maven_artifact() {
+        run("/maven2/com/example/lib/1.0.0/lib-1.0.0.jar", maven, true).await;
+    }
+
+    #[tokio::test]
+    async fn maven_metadata() {
+        run("/maven2/com/example/lib/maven-metadata.xml", maven, true).await;
+    }
+
+    #[tokio::test]
+    async fn maven_metadata_checksum() {
+        run(
+            "/maven2/com/example/lib/maven-metadata.xml.sha1",
+            maven,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docker_manifest() {
+        run("/v2/myorg/app/manifests/1.0", docker, true).await;
+    }
+
+    #[tokio::test]
+    async fn docker_blob() {
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        run(&format!("/v2/myorg/app/blobs/{blob}"), docker, true).await;
+    }
+
+    #[tokio::test]
+    async fn cargo_sparse_index() {
+        run("/cargo/index/se/rd/serde", cargo, false).await;
+    }
+
+    #[tokio::test]
+    async fn cargo_crate_metadata() {
+        run("/cargo/api/v1/crates/serde", cargo, false).await;
+    }
+
+    #[tokio::test]
+    async fn cargo_crate_download() {
+        run("/cargo/api/v1/crates/serde/1.0.0/download", cargo, false).await;
+    }
+
+    #[tokio::test]
+    async fn pypi_simple_index() {
+        run("/simple/flask/", pypi, true).await;
+    }
+
+    #[tokio::test]
+    async fn pypi_file() {
+        run("/simple/flask/flask-2.0.tar.gz", pypi, true).await;
+    }
+
+    #[tokio::test]
+    async fn terraform_module_download() {
+        run(
+            "/terraform/v1/modules/hashicorp/consul/aws/0.1.0/download",
+            terraform,
+            false,
+        )
+        .await;
     }
 }

@@ -12,8 +12,11 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
+use crate::circuit_breaker::BreakerScope;
+use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
+    UpstreamMiss,
 };
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
@@ -130,6 +133,9 @@ async fn package_versions(
     headers: HeaderMap,
 ) -> Response {
     let normalized = normalize_name(&name);
+    if !crate::validation::is_one_segment(&normalized) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let prefix = format!("pypi/{}/", normalized);
     let base_url = nora_base_url(&state);
 
@@ -244,6 +250,7 @@ async fn package_versions(
 
     let upstreams = state.config.pypi.upstreams();
     let mut circuit_open = false;
+    let mut miss = UpstreamMiss::default();
     if !is_internal && !upstreams.is_empty() {
         let mut upstream_files: Vec<FileEntry> = Vec::new();
         for up in &upstreams {
@@ -252,20 +259,24 @@ async fn package_versions(
                 &state.http_client,
                 &url,
                 Duration::from_secs(state.config.pypi.proxy_timeout),
-                up.auth(),
+                up.auth().map(UpstreamAuth::Basic),
                 Some(("Accept", "text/html")),
                 &state.circuit_breaker,
-                RegistryType::PyPI,
+                BreakerScope::upstream(RegistryType::PyPI, up.url()),
             )
             .await
             {
-                Ok(html) => upstream_files.extend(parse_upstream_files(&html)),
+                Ok(html) => {
+                    miss.answered();
+                    upstream_files.extend(parse_upstream_files(&html));
+                }
                 Err(crate::registry::ProxyError::CircuitOpen(_)) => {
                     circuit_open = true;
                     continue;
                 }
                 Err(e) => {
                     tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI upstream index fetch failed, skipping");
+                    miss.record(&e);
                     continue;
                 }
             }
@@ -306,12 +317,12 @@ async fn package_versions(
 
     // No upstream result and no local copy: a tripped breaker means the upstream is
     // temporarily down — return 503 (retryable) rather than 404, which would poison
-    // pip's negative cache.
+    // pip's negative cache; a failed upstream is 502 for the same reason.
     if circuit_open {
         return circuit_open_response(RegistryType::PyPI.as_str());
     }
 
-    StatusCode::NOT_FOUND.into_response()
+    miss.response("pypi", &normalized)
 }
 
 // ============================================================================
@@ -326,6 +337,9 @@ async fn download_file(
     Path((name, filename)): Path<(String, String)>,
 ) -> Response {
     let normalized = normalize_name(&name);
+    if !crate::validation::is_one_segment(&normalized) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     // Block download of internal bookkeeping files (dates.json, etc.) that
     // live alongside packages in storage but are not real artifacts (#891).
@@ -368,7 +382,7 @@ async fn download_file(
             &headers,
             crate::curation::RegistryType::PyPI,
             &normalized,
-            version.as_deref(),
+            crate::curation::RequestVersion::of_artifact(version.as_deref()),
             publish_date,
         ) {
             return response;
@@ -496,6 +510,7 @@ async fn download_file(
     // serves it, fetched from that same upstream with that upstream's auth. One
     // upstream's failure or open breaker skips to the next rather than failing (#663).
     let mut circuit_open = false;
+    let mut miss = UpstreamMiss::default();
     for up in &state.config.pypi.upstreams() {
         let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
 
@@ -503,10 +518,10 @@ async fn download_file(
             &state.http_client,
             &page_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            up.auth(),
+            up.auth().map(UpstreamAuth::Basic),
             Some(("Accept", "text/html")),
             &state.circuit_breaker,
-            RegistryType::PyPI,
+            BreakerScope::upstream(RegistryType::PyPI, up.url()),
         )
         .await
         {
@@ -517,12 +532,14 @@ async fn download_file(
             }
             Err(e) => {
                 tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI page proxy fetch failed, trying next upstream");
+                miss.record(&e);
                 continue;
             }
         };
 
         // The file may live on a later upstream — keep walking the list.
         let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
+            miss.answered();
             continue;
         };
 
@@ -530,9 +547,9 @@ async fn download_file(
             &state.http_client,
             &file_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            up.auth(),
+            up.auth().map(UpstreamAuth::Basic),
             &state.circuit_breaker,
-            RegistryType::PyPI,
+            BreakerScope::upstream(RegistryType::PyPI, up.url()),
         )
         .await
         {
@@ -589,18 +606,20 @@ async fn download_file(
             }
             Err(e) => {
                 tracing::debug!(error = ?e, package = %normalized, filename = %filename, upstream = %up.url(), "PyPI file proxy fetch failed, trying next upstream");
+                miss.record(&e);
                 continue;
             }
         }
     }
 
     // A tripped breaker means an upstream is temporarily down — 503 (retryable)
-    // rather than 404, which would poison pip's negative cache.
+    // rather than 404, which would poison pip's negative cache; a failed upstream is
+    // 502 for the same reason.
     if circuit_open {
         return circuit_open_response(RegistryType::PyPI.as_str());
     }
 
-    StatusCode::NOT_FOUND.into_response()
+    miss.response("pypi", &format!("{normalized}/{filename}"))
 }
 
 // ============================================================================
@@ -785,8 +804,8 @@ struct Pep691Meta {
 struct Pep691File {
     filename: String,
     url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hashes: Option<Pep691Hashes>,
+    /// Required by PEP 691 even when no digest is known — then it is `{}` (#1100).
+    hashes: Pep691Hashes,
     /// PEP 700 upload-time (RFC3339), when known (from the cached dates.json).
     #[serde(rename = "upload-time", skip_serializing_if = "Option::is_none")]
     upload_time: Option<String>,
@@ -797,7 +816,8 @@ struct Pep691File {
 
 #[derive(serde::Serialize)]
 struct Pep691Hashes {
-    sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
 }
 
 /// Render the PEP 691 + PEP 700 simple JSON. `pep700` maps filename → (size,
@@ -818,10 +838,9 @@ fn versions_json_response(
             Pep691File {
                 filename: f.filename.clone(),
                 url: format!("{}/simple/{}/{}", base, normalized, f.filename),
-                hashes: f
-                    .sha256
-                    .as_ref()
-                    .map(|h| Pep691Hashes { sha256: h.clone() }),
+                hashes: Pep691Hashes {
+                    sha256: f.sha256.clone(),
+                },
                 upload_time,
                 size,
             }
@@ -994,10 +1013,10 @@ async fn ensure_pypi_dates_cached(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            up.auth(),
+            up.auth().map(UpstreamAuth::Basic),
             Some(("Accept", PEP691_JSON)),
             &state.circuit_breaker,
-            RegistryType::PyPI,
+            BreakerScope::upstream(RegistryType::PyPI, up.url()),
         )
         .await
         else {
@@ -1035,9 +1054,10 @@ async fn ensure_pypi_dates_cached(
     map
 }
 
-/// Normalize package name according to PEP 503.
+/// Normalize package name according to PEP 503 — the one normalization curation also uses
+/// (`curation::pep503_normalize`): lowercase, every run of `-`, `_` and `.` one `-`.
 fn normalize_name(name: &str) -> String {
-    name.to_lowercase().replace(['-', '_', '.'], "-")
+    crate::curation::pep503_normalize(name)
 }
 
 /// Check Accept header for PEP 691 JSON.
@@ -1149,11 +1169,7 @@ fn is_valid_pypi_filename(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
-        && (ends_with_ci(name, ".tar.gz")
-            || ends_with_ci(name, ".tgz")
-            || ends_with_ci(name, ".whl")
-            || ends_with_ci(name, ".zip")
-            || ends_with_ci(name, ".egg"))
+        && nora_registry::pypi_files::served_extension(name).is_some()
 }
 
 /// Extract filename from PyPI download URL.
@@ -1161,16 +1177,7 @@ fn extract_filename(url: &str) -> Option<&str> {
     let url = url.split('#').next()?;
     let filename = url.rsplit('/').next()?;
 
-    if ends_with_ci(filename, ".tar.gz")
-        || ends_with_ci(filename, ".tgz")
-        || ends_with_ci(filename, ".whl")
-        || ends_with_ci(filename, ".zip")
-        || ends_with_ci(filename, ".egg")
-    {
-        Some(filename)
-    } else {
-        None
-    }
+    nora_registry::pypi_files::served_extension(filename).map(|_| filename)
 }
 
 /// Parse upstream PyPI simple index HTML into file entries.
@@ -1728,6 +1735,87 @@ mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send, send_with_headers};
     use axum::http::{header, Method, StatusCode};
 
+    /// A cold miss is "not found" only when an upstream said so. The simple index and a file
+    /// whose upstreams all failed (5xx after the retry, unreachable) answer 502, and so does a
+    /// file the index lists on a host that is down. An index that answers without the file,
+    /// or a 404, is still 404 — also while another upstream is down.
+    #[tokio::test]
+    async fn a_cold_miss_is_404_only_when_an_upstream_said_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        // The index answers and lists the file on the host that is down.
+        let lists_down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{}/files/flask-2.0.tar.gz">flask-2.0.tar.gz</a></body></html>"#,
+                down.uri()
+            )))
+            .mount(&lists_down)
+            .await;
+        // The index answers without the file.
+        let lists_other = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><a href="/files/flask-1.0.tar.gz">flask-1.0.tar.gz</a></body></html>"#,
+            ))
+            .mount(&lists_other)
+            .await;
+        // The index answers with no files at all.
+        let lists_nothing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html><body></body></html>"))
+            .mount(&lists_nothing)
+            .await;
+        let refused = "http://127.0.0.1:9".to_string();
+        let index = "/simple/flask/";
+        let file = "/simple/flask/flask-2.0.tar.gz";
+        for (upstreams, uri, want) in [
+            (vec![down.uri()], index, StatusCode::BAD_GATEWAY),
+            (vec![refused.clone()], index, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], index, StatusCode::NOT_FOUND),
+            (
+                vec![down.uri(), lists_nothing.uri()],
+                index,
+                StatusCode::NOT_FOUND,
+            ),
+            (vec![down.uri()], file, StatusCode::BAD_GATEWAY),
+            (vec![refused.clone()], file, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], file, StatusCode::NOT_FOUND),
+            (vec![lists_down.uri()], file, StatusCode::BAD_GATEWAY),
+            (vec![lists_other.uri()], file, StatusCode::NOT_FOUND),
+            (
+                vec![down.uri(), lists_other.uri()],
+                file,
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let urls = upstreams.clone();
+            let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+                // Plain URL entries, as `proxies = ["https://..."]` reads from the config file.
+                cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+            });
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), want, "{uri} {upstreams:?}");
+        }
+        assert!(!down.received_requests().await.unwrap().is_empty());
+        assert!(!missing.received_requests().await.unwrap().is_empty());
+        assert!(!lists_down.received_requests().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn test_pypi_list_empty() {
         let ctx = create_test_context();
@@ -1860,6 +1948,112 @@ mod integration_tests {
         assert_eq!(json["files"].as_array().unwrap().len(), 1);
         assert_eq!(json["files"][0]["filename"], "flask-2.0.tar.gz");
         assert_eq!(json["files"][0]["hashes"]["sha256"], "deadbeef");
+    }
+
+    /// #1100: every file in the simple JSON carries a `hashes` object, also a file NORA
+    /// has no digest for — an upstream link without `#sha256=` (a mirror that publishes
+    /// none) or a stored file without its sidecar. uv reads `hashes` as a required map
+    /// and refused the whole index (`missing field hashes`) when one file lacked it.
+    /// Parsed here the way uv parses it: absent or null fails, `{}` is read as no hashes.
+    #[tokio::test]
+    async fn test_pypi_json_every_file_has_hashes_object() {
+        use crate::test_helpers::create_test_context_with_config;
+        use std::collections::BTreeMap;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[derive(serde::Deserialize)]
+        struct StrictIndex {
+            files: Vec<StrictFile>,
+        }
+        #[derive(serde::Deserialize)]
+        struct StrictFile {
+            filename: String,
+            hashes: BTreeMap<String, String>,
+        }
+
+        let up_sha = "a".repeat(64);
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body>
+                <a href="https://up/flask-1.0.tar.gz">flask-1.0.tar.gz</a>
+                <a href="https://up/flask-1.1.tar.gz#sha256={up_sha}">flask-1.1.tar.gz</a>
+                </body></html>"#
+            )))
+            .mount(&upstream)
+            .await;
+
+        let proxied = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+        });
+        let local_only = create_test_context();
+        for ctx in [&proxied, &local_only] {
+            // Stored before sidecars and markers existed: no digest anywhere.
+            ctx.state
+                .storage
+                .put("pypi/flask/flask-0.9.tar.gz", b"old")
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put("pypi/flask/flask-2.0.tar.gz", b"data")
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put("pypi/flask/flask-2.0.tar.gz.sha256", b"deadbeef")
+                .await
+                .unwrap();
+        }
+
+        let none = BTreeMap::new();
+        let sha = |h: &str| BTreeMap::from([("sha256".to_string(), h.to_string())]);
+        for (ctx, want) in [
+            (
+                &proxied,
+                vec![
+                    ("flask-0.9.tar.gz", none.clone()),
+                    ("flask-1.0.tar.gz", none.clone()),
+                    ("flask-1.1.tar.gz", sha(&up_sha)),
+                    ("flask-2.0.tar.gz", sha("deadbeef")),
+                ],
+            ),
+            (
+                &local_only,
+                vec![
+                    ("flask-0.9.tar.gz", none.clone()),
+                    ("flask-2.0.tar.gz", sha("deadbeef")),
+                ],
+            ),
+        ] {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/simple/flask/",
+                vec![("Accept", "application/vnd.pypi.simple.v1+json")],
+                "",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_bytes(response).await;
+            let index: StrictIndex = serde_json::from_slice(&body).unwrap_or_else(|e| {
+                panic!(
+                    "a strict PEP 691 client cannot read the index: {e}\n{}",
+                    String::from_utf8_lossy(&body)
+                )
+            });
+            let mut got: Vec<(String, BTreeMap<String, String>)> = index
+                .files
+                .into_iter()
+                .map(|f| (f.filename, f.hashes))
+                .collect();
+            got.sort();
+            let want: Vec<(String, BTreeMap<String, String>)> =
+                want.into_iter().map(|(f, h)| (f.to_string(), h)).collect();
+            assert_eq!(got, want);
+        }
     }
 
     /// #896: NORA's simple JSON must also carry PEP 700 fields so clients (e.g. Renovate)
@@ -2104,6 +2298,34 @@ mod integration_tests {
 
     /// Regression test for #905: `ensure_pypi_dates_cached` must never fetch
     /// an internal-namespace package's metadata upstream (#68 dependency
+    /// A file whose version cannot be read from its name is refused by the
+    /// allowlist, not passed on as a metadata request.
+    #[tokio::test]
+    async fn allowlist_refuses_a_file_whose_version_it_cannot_read() {
+        use crate::test_helpers::create_test_context_with_config;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(&allowlist, r#"{"version": 1, "entries": [{"registry": "pypi", "name": "pkg", "version": "1.0.0"}]}"#).unwrap();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        ctx.state
+            .storage
+            .put("pypi/pkg/weird.tar.gz", b"sdist")
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, "/simple/pkg/weird.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = send(&ctx.app, Method::GET, "/simple/pkg/", "").await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "control: the index passes"
+        );
+    }
+
     /// confusion). Verify that a tarball download for an internal-namespace
     /// package does not trigger any upstream requests for the dates endpoint.
     #[tokio::test]
@@ -2583,6 +2805,140 @@ mod integration_tests {
              1-file and a 100-file index — {small} vs {large} means the cost scales with N"
         );
     }
+
+    // ── A name with an empty segment never names another key's file ─────────
+
+    /// A project name is one segment: `/simple/evilpkg%2F/...` decodes to `evilpkg/` and
+    /// `%2Fevilpkg` to `/evilpkg`, both naming the canonical file under a name the rule `evilpkg`
+    /// does not cover — refused before curation and storage.
+    #[tokio::test]
+    async fn a_project_name_with_an_empty_segment_is_refused_before_curation() {
+        use crate::test_helpers::create_test_context_with_config;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "pypi", "name": "evilpkg", "version": "*", "reason": "malware"}]}"#,
+        )
+        .unwrap();
+        let bp = blocklist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bp);
+        });
+        ctx.state
+            .storage
+            .put("pypi/evilpkg/evilpkg-1.0.tar.gz", b"MALWARE")
+            .await
+            .unwrap();
+        let canonical = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/evilpkg/evilpkg-1.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(canonical.status(), StatusCode::FORBIDDEN, "control");
+
+        let mut served = Vec::new();
+        for alias in [
+            "/simple/evilpkg%2F/evilpkg-1.0.tar.gz",
+            "/simple/%2Fevilpkg/evilpkg-1.0.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, alias, "").await;
+            if resp.status() == StatusCode::OK {
+                served.push(format!("{alias} -> {:?}", body_bytes(resp).await));
+            }
+        }
+        assert!(served.is_empty(), "blocklisted file served: {served:?}");
+    }
+
+    /// `/simple/%2Finternalpkg/` decodes to `/internalpkg`, which the isolation pattern
+    /// `internal*` does not match: it is refused, and the index of an internal project is never
+    /// requested from the public upstream.
+    #[tokio::test]
+    async fn a_leading_slash_name_never_takes_an_internal_project_upstream() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let leaked = || async {
+            upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().contains("internalpkg"))
+                .count()
+        };
+        let resp = send(&ctx.app, Method::GET, "/simple/internalpkg/", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        assert_eq!(leaked().await, 0, "control: canonical name is not proxied");
+
+        let resp = send(&ctx.app, Method::GET, "/simple/%2Finternalpkg/", "").await;
+        assert_eq!(
+            leaked().await,
+            0,
+            "internal project name sent to the public upstream (alias answered {})",
+            resp.status()
+        );
+    }
+
+    /// An upload under `dup/` never replaces the released `dup-1.0.tar.gz`.
+    #[tokio::test]
+    async fn an_upload_under_an_empty_segment_name_never_overwrites_a_release() {
+        let ctx = create_test_context();
+        ctx.state
+            .storage
+            .put("pypi/dup/dup-1.0.tar.gz", b"original")
+            .await
+            .unwrap();
+        let boundary = "p1aliasboundary";
+        let mut body = Vec::new();
+        for (name, value) in [
+            (":action", "file_upload"),
+            ("name", "dup/"),
+            ("version", "1.0"),
+        ] {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                    .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"content\"; filename=\"dup-1.0.tar.gz\"\r\nContent-Type: application/octet-stream\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(b"replacement\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/simple/",
+            vec![("content-type", ct.as_str())],
+            body,
+        )
+        .await;
+        assert!(!resp.status().is_success(), "{}", resp.status());
+        assert_eq!(
+            &ctx.state
+                .storage
+                .get("pypi/dup/dup-1.0.tar.gz")
+                .await
+                .unwrap()[..],
+            b"original"
+        );
+    }
 }
 
 // ============================================================================
@@ -2657,10 +3013,11 @@ mod spec_conformance_tests {
         );
     }
 
-    /// PEP 691: `hashes` field must be omitted when no hash is available,
-    /// not set to null or empty object.
+    /// PEP 691: "The hashes dictionary MUST be present, even if no hashes are
+    /// available for the file". With no digest it is the empty object — not absent
+    /// (uv: `missing field hashes`, #1100) and not null.
     #[test]
-    fn test_pep691_hashes_omitted_when_none() {
+    fn test_pep691_hashes_present_as_empty_object_when_none() {
         let files = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: None,
@@ -2672,10 +3029,70 @@ mod spec_conformance_tests {
                 .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert!(
-            json["files"][0].get("hashes").is_none(),
-            "hashes must be omitted (not null) when no hash available"
+        assert_eq!(
+            json["files"][0].get("hashes"),
+            Some(&serde_json::json!({})),
+            "hashes must be present as {{}} when no hash is available"
         );
+    }
+
+    /// Every file carries the CORRECT `hashes` object across the matrix: filename extension
+    /// (`.tar.gz` / `.whl`) × hash present/absent × each `(size, upload-time)` combination.
+    /// `hashes` is exactly `{}` when no digest is known and exactly `{"sha256": <hex>}` when
+    /// one is — never missing, `null`, an array, or an empty-string digest. The no-hash +
+    /// upload-time cell is the production proxy case uv rejected (#1100).
+    #[test]
+    fn test_pep691_hashes_object_present_across_pep700_matrix() {
+        use std::collections::HashMap;
+        // Both extensions, with and without a hash.
+        let specs: [(&str, Option<&str>); 4] = [
+            ("hashed-1.0.tar.gz", Some("deadbeef")),
+            ("nohash-1.0.tar.gz", None),
+            ("hashed-1.0-py3-none-any.whl", Some("cafef00d")),
+            ("nohash-1.0-py3-none-any.whl", None),
+        ];
+        let files: Vec<FileEntry> = specs
+            .iter()
+            .map(|(name, sha)| FileEntry {
+                filename: (*name).into(),
+                sha256: sha.map(str::to_string),
+            })
+            .collect();
+        let combos: [(Option<u64>, Option<String>); 4] = [
+            (None, None),
+            (Some(1234), None),
+            (None, Some("2026-01-01T00:00:00Z".to_string())),
+            (Some(1234), Some("2026-01-01T00:00:00Z".to_string())),
+        ];
+        for (size, upload_time) in combos {
+            let pep700: HashMap<String, (Option<u64>, Option<String>)> = specs
+                .iter()
+                .map(|(name, _)| ((*name).to_string(), (size, upload_time.clone())))
+                .collect();
+            let response = versions_json_response("pkg", &files, "http://nora:4000", &pep700);
+            let bytes = futures::executor::block_on(axum::body::to_bytes(
+                response.into_body(),
+                1024 * 1024,
+            ))
+            .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let arr = json["files"].as_array().expect("files array");
+            for (name, sha) in specs {
+                let file = arr
+                    .iter()
+                    .find(|f| f["filename"] == name)
+                    .unwrap_or_else(|| panic!("file {name} missing from response"));
+                let want = match sha {
+                    Some(h) => serde_json::json!({ "sha256": h }),
+                    None => serde_json::json!({}),
+                };
+                assert_eq!(
+                    file.get("hashes"),
+                    Some(&want),
+                    "wrong hashes for {name} (size={size:?} upload_time={upload_time:?})"
+                );
+            }
+        }
     }
 
     /// PEP 691: `name` field must match the normalized package name.
@@ -3204,5 +3621,446 @@ mod hash_marker_tests {
             &[hash_marker_key("proxied", filename, &digest(content))],
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_cases {
+    use crate::circuit_breaker::ProbeToken;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// the index lists the file on a host that answers 404 — the upstream said
+    /// "not found", so 404, not 502.
+    #[tokio::test]
+    async fn file_host_answering_404_is_404() {
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let lists_missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{}/files/flask-2.0.tar.gz">flask-2.0.tar.gz</a></body></html>"#,
+                missing.uri()
+            )))
+            .mount(&lists_missing)
+            .await;
+        let urls = vec![lists_missing.uri()];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+        });
+        let resp = send(&ctx.app, Method::GET, "/simple/flask/flask-2.0.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(!missing.received_requests().await.unwrap().is_empty());
+    }
+
+    /// one upstream's breaker is open, the other failed — the open breaker still
+    /// answers 503 (retryable), as before the change.
+    #[tokio::test]
+    async fn open_breaker_with_failed_peer_is_503() {
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let open = "http://127.0.0.1:1".to_string();
+        let urls = vec![open.clone(), down.uri()];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+        });
+        let key = crate::circuit_breaker::upstream_key("pypi", &open);
+        ctx.state
+            .circuit_breaker
+            .record_failure(&key, ProbeToken::BACKGROUND);
+        ctx.state
+            .circuit_breaker
+            .record_failure(&key, ProbeToken::BACKGROUND);
+        for uri in ["/simple/flask/flask-2.0.tar.gz", "/simple/flask/"] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_edge_cases {
+    use crate::circuit_breaker::ProbeToken;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The index alone, one upstream's breaker open and the other failed with
+    /// its own breaker still closed — the open breaker answers 503, as before the change.
+    #[tokio::test]
+    async fn index_open_breaker_with_failed_peer_is_503() {
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let open = "http://127.0.0.1:1".to_string();
+        let urls = vec![open.clone(), down.uri()];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+        });
+        let key = crate::circuit_breaker::upstream_key("pypi", &open);
+        for _ in 0..2 {
+            ctx.state
+                .circuit_breaker
+                .record_failure(&key, ProbeToken::BACKGROUND);
+        }
+        let resp = send(&ctx.app, Method::GET, "/simple/flask/", "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!down.received_requests().await.unwrap().is_empty());
+    }
+}
+
+/// A name or path with an empty segment (or, where the name is one segment, any `/`) never
+/// reaches curation, storage or an upstream: it would name another artifact's files, and an
+/// upstream that normalises paths would answer for that other artifact.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod empty_segment_requests {
+    use crate::test_helpers::{
+        blocklist_file, create_test_context_with_config, send, send_with_headers, upstream_paths,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream(body: &str) -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    #[tokio::test]
+    async fn a_download_under_an_empty_segment_name_never_reaches_upstream() {
+        let up = upstream("<html></html>").await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(up.uri());
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let control = "/simple/internalpkg/internalpkg-1.0.tar.gz";
+        let resp = send(&ctx.app, Method::GET, control, "").await;
+        assert!(!resp.status().is_success(), "control");
+        assert!(upstream_paths(&up).await.is_empty(), "control");
+        for uri in [
+            "/simple/%2Finternalpkg/internalpkg-1.0.tar.gz",
+            "/simple/internalpkg%2F%2Fx/internalpkg-1.0.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+
+    // The JSON index fetches release dates from the upstream; the name is refused first.
+    #[tokio::test]
+    async fn a_json_index_of_an_empty_segment_name_never_reaches_upstream() {
+        let up = upstream(r#"{"files":[]}"#).await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(up.uri());
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let accept = vec![("accept", "application/vnd.pypi.simple.v1+json")];
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/internalpkg/",
+            accept.clone(),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        assert!(upstream_paths(&up).await.is_empty(), "control");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/%2Finternalpkg/",
+            accept,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+
+    // A project name is one segment: a `%2F` that decodes to an inner `/` names another
+    // project's files (`corp-secret/x`, `evilpkg/evilpkg`) and is refused before curation,
+    // namespace isolation or the upstream see it.
+    #[tokio::test]
+    async fn a_project_name_with_an_inner_slash_never_reaches_upstream() {
+        let up = upstream("<html></html>").await;
+        let (_dir, blocklist) = blocklist_file("pypi", "evilpkg");
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(up.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+            cfg.curation.internal_namespaces = vec!["corp-secret".to_string()];
+        });
+        let resp = send(&ctx.app, Method::GET, "/simple/corp-secret/", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        assert!(upstream_paths(&up).await.is_empty(), "control");
+        for uri in [
+            "/simple/corp-secret%2Fx/",
+            "/simple/corp-secret%2Fx/corp-secret-1.0.tar.gz",
+            "/simple/evilpkg%2Fevilpkg/evilpkg-1.0.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+}
+
+/// Property tests against PEP 503: the normalized name is the registry's key for a project, so
+/// every spelling a client or an uploader may use lands on the one key pip asks for.
+#[cfg(test)]
+mod name_normalization_properties {
+    use super::normalize_name;
+    use proptest::prelude::*;
+
+    /// PEP 503: `re.sub(r"[-_.]+", "-", name).lower()`.
+    fn pep503(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        let mut in_run = false;
+        for c in name.chars() {
+            if matches!(c, '-' | '_' | '.') {
+                if !in_run {
+                    out.push('-');
+                }
+                in_run = true;
+            } else {
+                out.extend(c.to_lowercase());
+                in_run = false;
+            }
+        }
+        out
+    }
+
+    proptest! {
+        // Any PEP 508 project name normalizes as PEP 503 says.
+        #[test]
+        fn a_project_name_normalizes_as_pep_503_says(
+            name in "[A-Za-z0-9]([A-Za-z0-9._-]{0,20}[A-Za-z0-9])?"
+        ) {
+            prop_assert_eq!(normalize_name(&name), pep503(&name));
+        }
+
+        // Normalizing twice changes nothing.
+        #[test]
+        fn normalization_is_idempotent(name in "[A-Za-z0-9._-]{1,24}") {
+            let once = normalize_name(&name);
+            prop_assert_eq!(normalize_name(&once), once);
+        }
+    }
+
+    // An upload under a name with a run of separators is listed under the key pip asks for.
+    #[tokio::test]
+    async fn an_upload_is_listed_under_the_name_pip_asks_for() {
+        use super::local_index_cost_tests::{upload_body, BOUNDARY};
+        use crate::test_helpers::{body_bytes, create_test_context, send_with_headers};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context();
+        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        let filename = "foo_bar-1.0-py3-none-any.whl";
+        let body = upload_body("Foo__Bar", "1.0", filename, b"wheel");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/simple/",
+            vec![("content-type", content_type.as_str())],
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/foo-bar/",
+            vec![("accept", "text/html")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(html.contains(filename), "{html}");
+    }
+
+    #[test]
+    fn a_run_of_separators_is_one_dash() {
+        for (name, normalized) in [
+            ("foo__bar", "foo-bar"),
+            ("Foo._-Bar", "foo-bar"),
+            ("a--b", "a-b"),
+        ] {
+            assert_eq!(normalize_name(name), normalized, "{name}");
+        }
+    }
+}
+
+/// A version-specific blocklist rule holds for every spelling of an sdist's file name.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod blocked_version_in_any_sdist_spelling {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn a_blocked_version_is_refused_whatever_the_sdist_spelling() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SDIST".to_vec()))
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "pypi", "name": "python-dateutil", "version": "2.8.2", "reason": "malware"}]}"#,
+        )
+        .unwrap();
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist.to_string_lossy().into_owned());
+        });
+        for file in [
+            "python_dateutil-2.8.2.tar.gz",
+            "python-dateutil-2.8.2.tar.gz",
+            "Python.Dateutil-2.8.2.zip",
+            "python_dateutil-2.8.2-py2.py3-none-any.whl",
+        ] {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/simple/python-dateutil/{file}"),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
+        // Another version passes.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/python-dateutil/python-dateutil-2.8.1.tar.gz",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+/// A PyPI version is the version PEP 440 reads, not its spelling: pip compares parsed versions
+/// (`packaging.version.Version`), so a rule or an allowlist entry holds for every spelling of
+/// its version — `1.0-1` is `1.0.post1`, `2.0.0.RC1` is `2.0rc1`, `1.0.0` is `1.0`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod pep440_version_curation {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SDIST".to_vec()))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    fn write(dir: &tempfile::TempDir, file: &str, body: &str) -> String {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_rule_holds_for_every_spelling_of_its_version() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = write(
+            &dir,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [
+                {"registry": "pypi", "name": "foo", "version": "1.0.post1", "reason": "malware"},
+                {"registry": "pypi", "name": "foo", "version": "2.0rc1", "reason": "malware"}
+            ]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        for file in [
+            "foo-1.0.post1.tar.gz",
+            "foo-1.0-1.tar.gz",
+            "foo-1.0.POST1.zip",
+            "foo-1.0.0.post1.tar.gz",
+            "foo-1.0.0.post01.tar.gz",
+            "foo-2.0.0.RC1-py3-none-any.whl",
+            "foo-2.0-rc-1.tar.gz",
+            "foo-2.0c1.tar.gz",
+            "foo-v2.0rc1.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
+        for file in ["foo-1.0.tar.gz", "foo-2.0.tar.gz", "foo-1.0.post2.tar.gz"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_entry_admits_every_spelling_of_its_version() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = write(
+            &dir,
+            "allowlist.json",
+            r#"{"version": 1, "entries": [{"registry": "pypi", "name": "foo", "version": "1.0"}]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        for file in ["foo-1.0.tar.gz", "foo-1.0.0.tar.gz", "foo-v1.0.zip"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
+        for file in ["foo-1.1.tar.gz", "foo-1.0.post1.tar.gz"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
     }
 }

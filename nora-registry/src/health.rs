@@ -93,10 +93,10 @@ async fn check_storage_reachable(state: &AppState) -> bool {
 ///
 /// One entry per enabled registry, keyed by registry name. The state is read
 /// from the circuit breaker's cached in-memory snapshot — this never performs a
-/// live upstream probe, so `/health` stays fast and non-blocking (#468).
+/// live upstream probe, so `/health` stays fast and non-blocking (#468). A
+/// registry keyed per upstream (Docker, PyPI) reports its worst upstream.
 ///
-/// A registry with no recorded breaker yet (no proxy traffic since startup, or
-/// the breaker is keyed differently — e.g. Docker keys per upstream URL)
+/// A registry with no recorded breaker yet (no proxy traffic since startup)
 /// defaults to a healthy `closed` state. When the circuit-breaker feature is
 /// disabled (the default), every entry reports `disabled`.
 fn build_upstreams(state: &AppState) -> HashMap<String, UpstreamHealth> {
@@ -302,15 +302,19 @@ mod tests {
             cfg.circuit_breaker.enabled = true;
             cfg.circuit_breaker.failure_threshold = 2;
             cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.npm.proxy = Some("http://127.0.0.1:1".into());
         });
 
-        // Trip the npm breaker into Open via the cached state directly.
+        // Trip the breaker of the configured npm upstream into Open via the cached
+        // state directly: npm keys its breaker per upstream, and `/health` reports
+        // the worst one under the format name.
+        let key = crate::circuit_breaker::upstream_key("npm", "http://127.0.0.1:1");
         ctx.state
             .circuit_breaker
-            .record_failure("npm", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
         ctx.state
             .circuit_breaker
-            .record_failure("npm", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
 
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         let body = body_bytes(response).await;

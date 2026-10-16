@@ -89,6 +89,7 @@ pub struct DeletionPlan {
 /// Rules applied as AND:
 /// - `keep_last`: keep the N most recent versions (by modified time)
 /// - `older_than_days`: only delete versions older than X days
+/// - `include_tags`: nonempty glob patterns restrict eligible version names
 /// - `exclude_tags`: glob patterns that protect versions from deletion
 ///
 /// A version is deleted only if ALL conditions agree it should go.
@@ -112,6 +113,11 @@ pub fn plan_deletions(
     let mut non_excluded_pos: usize = 0;
 
     for version in &versions {
+        // An explicit scope protects unknown names, including future releases.
+        // Nonmatching names do not consume the eligible keep_last budget.
+        if !rule.include_tags.is_empty() && !is_excluded(&version.name, &rule.include_tags) {
+            continue;
+        }
         // Check exclusion patterns — excluded versions are invisible to keep_last (#926)
         if is_excluded(&version.name, &rule.exclude_tags) {
             continue;
@@ -499,7 +505,10 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
             if let Some(idx) = rest.find("/manifests/") {
                 let repo = &rest[..idx];
                 let tag_file = &rest[idx + "/manifests/".len()..];
-                if ends_with_ci(tag_file, ".json") && !ends_with_ci(tag_file, ".meta.json") {
+                if ends_with_ci(tag_file, ".json")
+                    && !ends_with_ci(tag_file, ".meta.json")
+                    && !ends_with_ci(tag_file, ".stats.json")
+                {
                     let tag = tag_file.strip_suffix(".json").unwrap_or(tag_file);
                     // Skip digest references (sha256:…, sha512:…) — they are
                     // stored alongside the tag file by put_manifest and must not
@@ -579,6 +588,12 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
             let hash_key = format!("{}.sha256", key);
             if storage.stat(&hash_key).await.is_some() {
                 keys.push(hash_key);
+            }
+            // Provenance sidecar of a proxied tarball (#1055, under an internal prefix
+            // that list() hides): part of the version too.
+            let origin_key = crate::registry::npm::origin_key(key);
+            if storage.stat(&origin_key).await.is_some() {
+                keys.push(origin_key);
             }
             if let Some(version) = crate::curation::parse_npm_tarball_version(pkg, filename) {
                 let version_key = format!("npm/{}/versions/{}.json", pkg, version);
@@ -1047,6 +1062,7 @@ mod tests {
             name_glob: None,
             keep_last,
             older_than_days,
+            include_tags: Vec::new(),
             exclude_tags: exclude_tags.into_iter().map(String::from).collect(),
         }
     }
@@ -1094,6 +1110,49 @@ mod tests {
     }
 
     // -- plan_deletions --
+
+    #[test]
+    fn test_include_tags_scopes_retention_and_keep_budget() {
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "docker",
+            "include_tags": ["preview-*"],
+            "keep_last": 1,
+            "older_than_days": 14
+        }))
+        .unwrap();
+        let versions = vec![
+            make_version("future-release-format", NOW - DAY, 100),
+            make_version("v1.0.0", NOW - 60 * DAY, 100),
+            make_version("preview-new", NOW - 30 * DAY, 100),
+            make_version("preview-old", NOW - 60 * DAY, 100),
+        ];
+        let plan = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].version_name, "preview-old");
+    }
+
+    #[test]
+    fn test_include_tags_keeps_excluded_tags_and_nonmatching_names() {
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "docker",
+            "include_tags": ["preview-*", "test-*"],
+            "exclude_tags": ["preview-protected"],
+            "older_than_days": 14
+        }))
+        .unwrap();
+        let versions = vec![
+            make_version("preview-protected", NOW - 60 * DAY, 100),
+            make_version("preview-old", NOW - 60 * DAY, 100),
+            make_version("test-old", NOW - 60 * DAY, 100),
+            make_version("preview-recent", NOW - DAY, 100),
+            make_version("release-old", NOW - 60 * DAY, 100),
+        ];
+        let plan = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plan.len(), 2);
+        assert!(plan
+            .iter()
+            .all(|entry| matches!(entry.version_name.as_str(), "preview-old" | "test-old")));
+    }
 
     #[test]
     fn test_keep_last_basic() {
@@ -1740,6 +1799,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(3),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1748,6 +1808,46 @@ mod tests {
         assert_eq!(
             result.planned, 1,
             "exactly 1 tag should be planned for deletion"
+        );
+    }
+
+    /// #1114: a `.stats.json` pull-stats sidecar is not a tag — retention must
+    /// not count it toward keep_last. With 4 tags and keep_last=3 exactly one tag
+    /// is planned; if the sidecar were mistaken for a fifth tag, two would be.
+    #[tokio::test]
+    async fn retention_does_not_treat_the_stats_sidecar_as_a_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        for (i, tag) in ["v1", "v2", "v3", "v4"].iter().enumerate() {
+            let body = serde_json::to_vec(&serde_json::json!({"tag": tag, "i": i})).unwrap();
+            storage
+                .put(&format!("docker/img/manifests/{}.json", tag), &body)
+                .await
+                .unwrap();
+        }
+        // A pull-stats sidecar beside one tag — NOT a fifth tag.
+        storage
+            .put(
+                "docker/img/manifests/v1.stats.json",
+                b"{\"downloads\":3,\"last_pulled\":1}",
+            )
+            .await
+            .unwrap();
+
+        let rules = vec![RetentionRule {
+            registry: "docker".to_string(),
+            name_glob: None,
+            keep_last: Some(3),
+            older_than_days: None,
+            include_tags: Vec::new(),
+            exclude_tags: vec![],
+        }];
+        let result =
+            super::run_retention(&storage, &test_publish_locks(), None, &rules, true).await;
+        assert_eq!(
+            result.planned, 1,
+            "one real tag planned; the .stats.json sidecar is not a tag"
         );
     }
 
@@ -1788,6 +1888,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(3),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
         let result =
@@ -1821,6 +1922,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1851,6 +1953,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1878,6 +1981,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1904,6 +2008,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1943,6 +2048,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1980,6 +2086,7 @@ mod format_retention_tests {
             name_glob: glob.map(String::from),
             keep_last: keep,
             older_than_days: days,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }
     }
@@ -2307,6 +2414,36 @@ mod format_retention_tests {
     /// the version. The invariant is stated without naming which versions
     /// survive, because that depends on mtime ordering — what must hold is that
     /// the registry never promises an artifact it does not have.
+    #[tokio::test]
+    async fn test_npm_origin_sidecar_is_not_a_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put("npm/a/tarballs/a-1.0.0.tgz", b"tgz")
+            .await
+            .unwrap();
+        storage
+            .put(
+                &crate::registry::npm::origin_key("npm/a/tarballs/a-1.0.0.tgz"),
+                b"npm:https://r.example",
+            )
+            .await
+            .unwrap();
+        let groups = collect_npm_versions(&storage).await;
+        let (_, versions) = groups
+            .iter()
+            .find(|(p, _)| p == "npm:a")
+            .expect("package a");
+        assert_eq!(versions.len(), 1, "the provenance sidecar is not a version");
+        assert!(
+            versions[0].keys.contains(&crate::registry::npm::origin_key(
+                "npm/a/tarballs/a-1.0.0.tgz"
+            )),
+            "…but it is part of the version's key set (#961): {:?}",
+            versions[0].keys
+        );
+    }
+
     #[tokio::test]
     async fn test_npm_retention_packument_matches_storage() {
         let ctx = create_test_context();

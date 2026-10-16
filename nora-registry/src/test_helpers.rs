@@ -12,7 +12,7 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit},
     http::Request,
-    middleware, Router,
+    Router,
 };
 use http_body_util::BodyExt;
 use std::collections::HashMap;
@@ -95,6 +95,14 @@ pub fn create_test_context_with_storage_and_config(
 }
 
 /// Build a test context with auth + anonymous_read + custom config tweaks.
+/// Auth required for every request (no anonymous read), plus a custom config.
+pub fn create_test_context_with_auth_and_config(
+    users: &[(&str, &str)],
+    customize: impl FnOnce(&mut Config),
+) -> TestContext {
+    build_context(true, users, false, customize)
+}
+
 pub fn create_test_context_with_anonymous_read_and_config(
     users: &[(&str, &str)],
     customize: impl FnOnce(&mut Config),
@@ -158,6 +166,7 @@ fn build_context_with(
             enabled: true,
             proxy: None,
             proxy_auth: None,
+            proxies: Vec::new(),
             proxy_timeout: 5,
             metadata_ttl: -1,
             serve_stale: true,
@@ -238,7 +247,11 @@ fn build_context_with(
         curation: CurationConfig::default(),
         circuit_breaker: crate::config::CircuitBreakerConfig::default(),
         tls: crate::config::TlsConfig::default(),
-        audit: crate::config::AuditConfig::default(),
+        // Off unless a test opts in (`cfg.audit.mode = AuditMode::File`); the state
+        // below builds its audit log from this mode, as main.rs does.
+        audit: crate::config::AuditConfig {
+            mode: crate::audit::AuditMode::Off,
+        },
         registries: None,
         signing: crate::config::SigningConfig::default(),
     };
@@ -290,9 +303,20 @@ fn build_context_with(
             crate::curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
         curation_engine.set_namespace_filter(Box::new(ns_filter));
     }
+    // main.rs installs min-release-age too; without it every age test through this
+    // context checked nothing (found by #1055: a positive control passed a release
+    // dated today through a 7d gate).
+    if let Some(ref age_str) = config.curation.min_release_age {
+        if let Ok(secs) = crate::curation::parse_duration(age_str) {
+            let mut filter = crate::curation::MinReleaseAgeFilter::new(secs, age_str);
+            crate::load_registry_overrides(&mut filter, &config.curation);
+            curation_engine.add_filter(Box::new(filter));
+        }
+    }
 
     let enabled_registries = config.enabled_registries();
     let cb_config = config.circuit_breaker.clone();
+    let audit_mode = config.audit.mode.clone();
 
     let bypass_token = config.curation.bypass_token.clone();
     let reloadable = Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
@@ -322,7 +346,7 @@ fn build_context_with(
         tokens,
         metrics: Arc::new(DashboardMetrics::new()),
         activity: Arc::new(ActivityLog::new(50)),
-        audit: Arc::new(AuditLog::new(&storage_path, crate::audit::AuditMode::Off)),
+        audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client: reqwest::Client::new(),
@@ -340,6 +364,7 @@ fn build_context_with(
         signer,
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        pull_stats: std::sync::Arc::new(crate::registry::docker::PullStatsAccumulator::default()),
     };
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
@@ -407,21 +432,15 @@ fn build_context_with(
         .merge(crate::ui::routes())
         .merge(registry_routes);
 
-    let app = Router::new()
+    let routes = Router::new()
         .merge(public_routes)
         .merge(app_routes)
         .merge(crate::admin::routes())
         .layer(DefaultBodyLimit::max(
             state.config.server.body_limit_mb * 1024 * 1024,
-        ))
-        .layer(middleware::from_fn(
-            crate::request_id::request_id_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::auth::auth_middleware,
-        ))
-        .with_state(state.clone());
+        ));
+    // The server's own request layers (auth, request id, audit, …), so tests run its order.
+    let app = crate::request_layers(routes, &state).with_state(state.clone());
 
     TestContext {
         state,
@@ -670,5 +689,132 @@ impl crate::storage::StorageBackend for OpCountingBackend {
     )> {
         self.counts.hit("get_range");
         self.inner.get_range(key, start, end).await
+    }
+}
+
+// ── Per-registry artifact counts, each read from its real source ────────────
+
+/// The three per-registry artifact counts an operator can read for one store.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArtifactCounts {
+    /// Dashboard card: `/api/ui/dashboard` → `registry_stats[].artifact_count`
+    /// (the HTML dashboard renders the same `build_dashboard_response`).
+    pub dashboard: usize,
+    /// `/api/ui/stats` → the registry's field.
+    pub stats: usize,
+    /// `nora_artifacts_total{registry}`: the 60 s tick in `main.rs` sets the gauge
+    /// verbatim from `repo_index.counts()`, read here after the two endpoints above
+    /// rebuilt the index. Read directly rather than through the process-global
+    /// gauge, which parallel tests would race on.
+    pub metric: usize,
+}
+
+/// Read [`ArtifactCounts`] for `registry` through the router and the shared index.
+pub async fn artifact_counts(ctx: &TestContext, registry: &str) -> ArtifactCounts {
+    use axum::http::{Method, StatusCode};
+
+    let resp = send(&ctx.app, Method::GET, "/api/ui/dashboard", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let dashboard: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let card = dashboard["registry_stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["name"] == registry)
+        .unwrap_or_else(|| panic!("no dashboard card for {registry}: {dashboard}"));
+    let dashboard = card["artifact_count"].as_u64().unwrap() as usize;
+
+    let resp = send(&ctx.app, Method::GET, "/api/ui/stats", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stats: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let stats = stats[registry].as_u64().unwrap() as usize;
+
+    let rt = crate::registry_type::RegistryType::from_str_opt(registry).unwrap();
+    let metric = ctx.state.repo_index.counts().get(&rt).copied().unwrap_or(0);
+
+    ArtifactCounts {
+        dashboard,
+        stats,
+        metric,
+    }
+}
+
+/// The path of every request an upstream mock has received, in order.
+pub async fn upstream_paths(upstream: &wiremock::MockServer) -> Vec<String> {
+    upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect()
+}
+
+/// A curation blocklist file refusing every version of `name` in `registry`. Keep the
+/// directory alive while a context uses the path.
+pub fn blocklist_file(registry: &str, name: &str) -> (TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("blocklist.json");
+    std::fs::write(
+        &path,
+        format!(r#"{{"version": 1, "rules": [{{"registry": "{registry}", "name": "{name}", "version": "*", "reason": "malware"}}]}}"#),
+    )
+    .unwrap();
+    (dir, path.to_string_lossy().into_owned())
+}
+
+/// Readers of a source file for white-list teeth: which functions hold a call, and the body of a
+/// function. They read production code only — everything before the first test module.
+pub mod source_reader {
+    /// Production code: everything before the first `#[cfg(test)]` at the start of a line.
+    pub fn production(source: &str) -> &str {
+        &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())]
+    }
+
+    /// The name a top-level function's signature line declares (`fn`, `async fn`, `pub fn`,
+    /// `pub(crate) async fn`, …), if the line is one.
+    fn declares(line: &str) -> Option<&str> {
+        let mut rest = line;
+        for prefix in ["pub(crate) ", "pub "] {
+            rest = rest.strip_prefix(prefix).unwrap_or(rest);
+        }
+        rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = rest.strip_prefix("fn ")?;
+        Some(&rest[..rest.find(['(', '<']).unwrap_or(rest.len())])
+    }
+
+    /// The body of the top-level function `name`, from its signature to its closing brace.
+    pub fn body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+        let mut offset = 0;
+        for line in source.split_inclusive('\n') {
+            if declares(line) == Some(name) {
+                let end = source[offset..].find("\n}\n").map(|end| offset + end)?;
+                return Some(&source[offset..end]);
+            }
+            offset += line.len();
+        }
+        None
+    }
+
+    /// The top-level functions whose bodies contain `needle`, a call on the signature's own line
+    /// included; `fn needle(` itself is no call.
+    pub fn holders(source: &str, needle: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut current = String::new();
+        for line in source.lines() {
+            if let Some(name) = declares(line) {
+                current = name.to_string();
+            }
+            // An occurrence that names the function being declared (`fn needle(`) is not a call.
+            if line
+                .match_indices(needle)
+                .any(|(at, _)| !line[..at].ends_with("fn "))
+            {
+                found.push(current.clone());
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
     }
 }

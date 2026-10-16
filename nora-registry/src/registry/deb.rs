@@ -27,6 +27,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
+use crate::config::UpstreamAuth;
 use crate::registry::{method_not_allowed, proxied_repo_conflict};
 use crate::validation::validate_storage_key;
 use crate::AppState;
@@ -767,7 +768,7 @@ async fn download(
             format!("{repo}/{path}"),
             key,
             url,
-            entry.auth(),
+            entry.auth().map(UpstreamAuth::Basic),
             state.config.deb.proxy_timeout,
             state.config.deb.metadata_ttl,
             immutable,
@@ -1726,6 +1727,45 @@ mod integration_tests {
                 "{name}"
             );
         }
+    }
+
+    /// The internal `.nora-meta/` sidecars are refused on every path to them: an empty segment
+    /// in front (`//.nora-meta/…`, or an empty `{repo}` segment) is refused with the path, not
+    /// read as a key that names the sidecar file.
+    #[tokio::test]
+    async fn an_empty_segment_never_reaches_the_metadata_sidecars() {
+        let ctx = create_test_context();
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/tree.deb",
+            build_test_deb("tree", "1.0"),
+        )
+        .await;
+        assert!(put.status().is_success(), "{}", put.status());
+        let control = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/myrepo/.nora-meta/tree.deb.json",
+            "",
+        )
+        .await;
+        assert_eq!(control.status(), StatusCode::BAD_REQUEST, "control");
+
+        let mut served = Vec::new();
+        for alias in [
+            "/deb/myrepo//.nora-meta/tree.deb.json",
+            "/deb//myrepo/.nora-meta/tree.deb.json",
+        ] {
+            let resp = send(&ctx.app, Method::GET, alias, "").await;
+            if resp.status() == StatusCode::OK {
+                served.push(format!(
+                    "{alias} -> {}",
+                    String::from_utf8_lossy(&body_bytes(resp).await)
+                ));
+            }
+        }
+        assert!(served.is_empty(), "internal sidecar served: {served:?}");
     }
 }
 

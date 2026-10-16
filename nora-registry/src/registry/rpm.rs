@@ -19,6 +19,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
+use crate::config::UpstreamAuth;
 use crate::registry::{method_not_allowed, proxied_repo_conflict};
 use crate::validation::validate_storage_key;
 use crate::AppState;
@@ -830,7 +831,7 @@ async fn download(
             format!("{repo}/{path}"),
             key,
             url,
-            entry.auth(),
+            entry.auth().map(UpstreamAuth::Basic),
             state.config.rpm.proxy_timeout,
             state.config.rpm.metadata_ttl,
             immutable,
@@ -1756,6 +1757,43 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let resp = send(&ctx.app, Method::PUT, "/rpm/myrepo/x.rpm", b"x".to_vec()).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// As for deb: an empty segment in front of `.nora-meta/` never reaches the sidecar file.
+    #[tokio::test]
+    async fn an_empty_segment_never_reaches_the_metadata_sidecars() {
+        let ctx = create_test_context();
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/hello.rpm",
+            build_test_rpm("hello", "1.0"),
+        )
+        .await;
+        assert!(put.status().is_success(), "{}", put.status());
+        let control = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/myrepo/.nora-meta/hello.rpm.json",
+            "",
+        )
+        .await;
+        assert_eq!(control.status(), StatusCode::BAD_REQUEST, "control");
+
+        let mut served = Vec::new();
+        for alias in [
+            "/rpm/myrepo//.nora-meta/hello.rpm.json",
+            "/rpm//myrepo/.nora-meta/hello.rpm.json",
+        ] {
+            let resp = send(&ctx.app, Method::GET, alias, "").await;
+            if resp.status() == StatusCode::OK {
+                served.push(format!(
+                    "{alias} -> {}",
+                    String::from_utf8_lossy(&body_bytes(resp).await)
+                ));
+            }
+        }
+        assert!(served.is_empty(), "internal sidecar served: {served:?}");
     }
 }
 

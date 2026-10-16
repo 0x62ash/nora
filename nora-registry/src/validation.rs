@@ -14,8 +14,10 @@ use axum::{
 };
 use std::fmt;
 
-/// Validation errors
+/// Validation errors. Non-exhaustive: a new refusal adds a variant without breaking
+/// code that matches on it.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ValidationError {
     /// Path contains traversal sequences (../, etc.)
     PathTraversal,
@@ -31,6 +33,11 @@ pub enum ValidationError {
     TooLong { max: usize, actual: usize },
     /// Contains forbidden characters
     ForbiddenCharacter(char),
+    /// Names a path the storage reserves for itself
+    ReservedPath(&'static str),
+    /// Has an empty path segment (`a//b`, `a/b/`): it would name the same stored object as
+    /// the key without it
+    EmptySegment,
 }
 
 impl fmt::Display for ValidationError {
@@ -45,6 +52,8 @@ impl fmt::Display for ValidationError {
                 write!(f, "Input exceeds maximum length ({} > {})", actual, max)
             }
             Self::ForbiddenCharacter(c) => write!(f, "Forbidden character: {:?}", c),
+            Self::EmptySegment => write!(f, "Empty path segment"),
+            Self::ReservedPath(p) => write!(f, "Reserved path: {}", p),
         }
     }
 }
@@ -61,6 +70,12 @@ pub fn ends_with_ci(s: &str, suffix: &str) -> bool {
 
 /// Maximum allowed storage key length
 const MAX_KEY_LENGTH: usize = 1024;
+
+/// Service directory under the local storage root where writes in progress are
+/// staged, and where a start removes what dead instances left. Not a storage key:
+/// [`validate_storage_key`] refuses a key whose first segment names it, so no request,
+/// restored archive or migrated bucket can place a key there.
+pub const STAGING_DIR: &str = ".nora-staging";
 
 /// Maximum Docker name length
 const MAX_DOCKER_NAME_LENGTH: usize = 256;
@@ -97,6 +112,16 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::ForbiddenCharacter('\0'));
     }
 
+    // The local backend's staging directory: a start deletes what dead instances
+    // left there, so a key in it would be deleted too.
+    if key
+        .split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(STAGING_DIR))
+    {
+        return Err(ValidationError::ReservedPath(STAGING_DIR));
+    }
+
     // Check for absolute paths
     if key.starts_with('/') || key.starts_with('\\') {
         return Err(ValidationError::PathTraversal);
@@ -112,11 +137,13 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::PathTraversal);
     }
 
-    // Check each segment
+    // Check each segment. An empty one (`a//b`, `a/b/`) is refused: the local backend
+    // joins `a//b` to the same file as `a/b`, and object stores drop empty path parts, so
+    // the key would be a second name for another key's object — and curation, pins and
+    // namespace checks keyed by the string would see a different key than the bytes.
     for segment in key.split('/') {
-        if segment.is_empty() && !key.is_empty() {
-            // Allow trailing slash but not double slashes
-            continue;
+        if segment.is_empty() {
+            return Err(ValidationError::EmptySegment);
         }
         if segment == "." || segment == ".." {
             return Err(ValidationError::PathTraversal);
@@ -124,6 +151,21 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
     }
 
     Ok(())
+}
+
+/// Whether `name`, taken from a request where it must stand for exactly one path segment (a
+/// PyPI project, a cargo version), is one: no `/` — a `%2F` in the URL decodes to one — and a
+/// valid storage key on its own, so no empty, `.` or `..` segment either. Anything else would
+/// name another artifact's files.
+pub fn is_one_segment(name: &str) -> bool {
+    !name.contains('/') && validate_storage_key(name).is_ok()
+}
+
+/// The storage key a listing prefix stands for: the prefix without the one `/` it may end
+/// in (`npm/pkg/versions/` lists what is under `npm/pkg/versions`). A listing validates this
+/// key with [`validate_storage_key`], so a prefix with any other empty segment is refused.
+pub fn listing_key(prefix: &str) -> &str {
+    prefix.strip_suffix('/').unwrap_or(prefix)
 }
 
 /// Validate Docker image name per OCI distribution spec.
@@ -398,6 +440,11 @@ pub fn namespace_match(pattern: &str, value: &str) -> bool {
     }
     let pat: Vec<&str> = pattern.split('/').collect();
     let val: Vec<&str> = value.split('/').collect();
+    // An empty segment (`a//b`, `a/`) names nothing a restricted scope could grant —
+    // neither `*` inside a segment nor `**` across segments may consume one.
+    if val.iter().any(|segment| segment.is_empty()) {
+        return false;
+    }
     segments_match(&pat, &val)
 }
 
@@ -433,6 +480,10 @@ fn segment_glob(pattern: &str, value: &str) -> bool {
     if !pattern.contains('*') {
         return pattern == value;
     }
+    // An empty segment (`a//b`) names nothing: a wildcard must not grant it.
+    if value.is_empty() {
+        return false;
+    }
     // Byte-wise is UTF-8-safe here: `*` is ASCII and never a continuation byte,
     // and non-wildcard bytes must be equal anyway.
     let (p, v) = (pattern.as_bytes(), value.as_bytes());
@@ -460,6 +511,58 @@ fn segment_glob(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wildcard matches inside a segment but never an empty segment, which names nothing.
+    #[test]
+    fn a_wildcard_does_not_match_an_empty_segment() {
+        assert!(!segment_glob("*", ""));
+        assert!(!segment_glob("a*", ""));
+        assert!(segment_glob("*", "x"));
+        assert!(segment_glob("a*", "a"));
+        assert!(segment_glob("", ""));
+    }
+
+    /// A storage key has no empty segment anywhere; a listing prefix may end in one `/`.
+    #[test]
+    fn a_key_has_no_empty_segment_and_a_prefix_may_end_in_a_slash() {
+        for key in ["a//b", "a/b/", "raw//x", "npm/x/"] {
+            assert_eq!(
+                validate_storage_key(key),
+                Err(ValidationError::EmptySegment),
+                "{key}"
+            );
+        }
+        assert!(validate_storage_key("a/b").is_ok());
+        assert!(validate_storage_key(listing_key("npm/pkg/versions/")).is_ok());
+        assert!(validate_storage_key(listing_key("npm/pkg")).is_ok());
+        for prefix in ["a//b/", "a/b//", "/a/"] {
+            assert!(
+                validate_storage_key(listing_key(prefix)).is_err(),
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_one_segment_name_has_no_slash_and_is_a_valid_key() {
+        for name in ["flask", "my-pkg_2", "1.0.0", "v1.0.0+build"] {
+            assert!(is_one_segment(name), "{name}");
+        }
+        for name in [
+            "",
+            "corp-secret/x",
+            "/x",
+            "x/",
+            "a//b",
+            ".",
+            "..",
+            "a\\b",
+            "a\0b",
+            "naïve",
+        ] {
+            assert!(!is_one_segment(name), "{name:?}");
+        }
+    }
 
     // Storage key tests
     #[test]
@@ -526,6 +629,31 @@ mod tests {
             validate_storage_key(""),
             Err(ValidationError::EmptyInput)
         ));
+    }
+
+    /// The local backend stages writes in progress under `<root>/.nora-staging/`,
+    /// and a start removes what dead instances left there. A key in that directory
+    /// (from a restored archive, a migrated bucket, a crafted request) would be
+    /// staging the next start deletes, so no key may name it. Only the first segment
+    /// is reserved.
+    #[test]
+    fn storage_key_refuses_the_staging_directory() {
+        for key in [
+            ".nora-staging",
+            ".nora-staging/",
+            ".nora-staging/0b1c/17.tmp",
+            ".NORA-Staging/x",
+        ] {
+            assert!(validate_storage_key(key).is_err(), "{key} must be refused");
+        }
+        for key in [
+            "raw/.nora-staging/x",
+            ".nora-staging-other/x",
+            ".nora-stagingx",
+            "raw/report.tmp.1.2",
+        ] {
+            assert!(validate_storage_key(key).is_ok(), "{key} must stay valid");
+        }
     }
 
     #[test]
@@ -919,15 +1047,31 @@ mod namespace_match_tests {
             prop_assert!(!namespace_match(&seg, &value));
         }
 
-        // `prefix/**` matches every value under `prefix/`.
+        // `prefix/**` matches every value under `prefix/` (segments are never empty: a
+        // coordinate with one names nothing, see the next property).
         #[test]
         fn prop_double_star_matches_all_descendants(
             prefix in "[a-z][a-z0-9]{0,9}",
-            descendant in "[a-z][a-z0-9/]{0,30}",
+            descendant in "[a-z][a-z0-9]{0,8}(/[a-z0-9]{1,8}){0,3}",
         ) {
             let pattern = format!("{}/**", prefix);
             let value = format!("{}/{}", prefix, descendant);
             prop_assert!(namespace_match(&pattern, &value));
+        }
+
+        // A value with an empty segment — inside or at the end — is granted by no
+        // restricted pattern, `**` included.
+        #[test]
+        fn prop_double_star_never_grants_an_empty_segment(
+            prefix in "[a-z][a-z0-9]{0,9}",
+            head in "[a-z][a-z0-9]{0,8}",
+            tail in "([a-z0-9]{1,8})?",
+        ) {
+            let pattern = format!("{}/**", prefix);
+            let value = format!("{}/{}//{}", prefix, head, tail);
+            let trailing = format!("{}/{}/", prefix, head);
+            prop_assert!(!namespace_match(&pattern, &value));
+            prop_assert!(!namespace_match(&pattern, &trailing));
         }
 
         // An intra-segment `*` absorbs any run of characters inside one segment…
@@ -962,6 +1106,34 @@ mod namespace_match_tests {
             b in "[a-z]{1,8}(/[a-z]{1,8}){0,3}",
         ) {
             prop_assert_eq!(namespace_match(&a, &b), a == b);
+        }
+    }
+
+    /// No all-`*` segment pattern grants an empty segment.
+    #[test]
+    fn an_all_star_segment_does_not_match_an_empty_segment() {
+        for pat in ["*", "**", "***", "****"] {
+            assert!(!segment_glob(pat, ""), "{pat}");
+        }
+        assert!(!namespace_match("org/***", "org/"));
+        assert!(!namespace_match("org/***/x", "org//x"));
+        assert!(namespace_match("org/***", "org/a"), "control");
+    }
+
+    #[test]
+    fn a_double_star_grants_no_empty_segment_anywhere() {
+        assert!(namespace_match("github/**", "github/a/b"), "control");
+        assert!(namespace_match("**", "x"), "control");
+        for (pattern, value) in [
+            ("github/**", "github//x"),
+            ("github/**", "github/x/"),
+            ("github/**", "github/"),
+            ("**", "/x"),
+            ("**", "/"),
+            ("**", "//x"),
+            ("**/x", "/x"),
+        ] {
+            assert!(!namespace_match(pattern, value), "{pattern} {value}");
         }
     }
 }

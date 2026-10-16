@@ -4,11 +4,11 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
-use crate::circuit_breaker::{CircuitBreakerRegistry, ProbeToken};
+use crate::circuit_breaker::{upstream_key, CircuitBreakerRegistry, ProbeToken};
 use crate::config::basic_auth_header;
 use crate::proxy_coalesce::Flight;
 use crate::registry::docker_auth::DockerAuth;
-use crate::registry::{circuit_open_response, method_not_allowed, ProxyError};
+use crate::registry::{circuit_open_response, method_not_allowed, ProxyError, UpstreamMiss};
 use crate::registry::{
     content_length, sha256_of_file, stream_body_to_file, StreamOutcome, TempFileGuard,
 };
@@ -373,6 +373,58 @@ pub struct LayerInfo {
     pub size: u64,
 }
 
+/// One manifest's un-flushed pull statistics (#1114).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct PullDelta {
+    /// Pulls counted since the last flush.
+    pub downloads: u64,
+    /// Most recent pull time (unix secs) seen since the last flush.
+    pub last_pulled: u64,
+}
+
+/// In-memory, off-request-path accumulator for docker pull statistics (#1114).
+///
+/// A manifest GET bumps the per-key counter here (a microsecond lock, no I/O)
+/// instead of rewriting the manifest's `.meta.json` — which every pull used to
+/// do and which raced the request-path publish-date read, logging INTEGRITY
+/// VIOLATION on healthy data. A background task drains this in batches into a
+/// separate `.stats.json` sidecar, so `.meta.json` is immutable after publish.
+///
+/// Soft state: the map is rebuildable-empty after a restart, so at most one
+/// flush interval of counts is lost on a crash (accepted — pull stats are
+/// best-effort, like the in-memory indexes). Mirrors the `publish_locks`
+/// pattern (`parking_lot::Mutex<HashMap>`) to add no new dependency.
+#[derive(Default)]
+pub(crate) struct PullStatsAccumulator {
+    inner: parking_lot::Mutex<std::collections::HashMap<String, PullDelta>>,
+}
+
+impl PullStatsAccumulator {
+    /// Record one pull of `meta_key` at `now` (unix secs). Cheap: a brief lock,
+    /// no storage I/O, no spawn, no publish lock.
+    pub(crate) fn record(&self, meta_key: &str, now: u64) {
+        let mut g = self.inner.lock();
+        let e = g.entry(meta_key.to_string()).or_default();
+        e.downloads += 1;
+        if now > e.last_pulled {
+            e.last_pulled = now;
+        }
+    }
+
+    /// Take and clear every accumulated delta — for the flush task.
+    pub(crate) fn drain(&self) -> Vec<(String, PullDelta)> {
+        std::mem::take(&mut *self.inner.lock())
+            .into_iter()
+            .collect()
+    }
+
+    /// The current un-flushed delta for one key (for the UI read path to add on
+    /// top of the flushed sidecar value). Default (zeros) when nothing pending.
+    pub(crate) fn peek(&self, meta_key: &str) -> PullDelta {
+        self.inner.lock().get(meta_key).copied().unwrap_or_default()
+    }
+}
+
 /// In-progress upload session with metadata.
 ///
 /// Blob data is streamed frame-by-frame to a temporary file, bounded per request
@@ -581,26 +633,7 @@ pub fn cleanup_expired_sessions(sessions: &RwLock<HashMap<String, UploadSession>
 /// `SESSION_TTL` age guard keeps in-progress uploads safe under the periodic call.
 pub fn cleanup_upload_temp_dir(data_dir: &str) {
     let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-uploads");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "Failed to read upload temp directory for cleanup");
-            return;
-        }
-    };
-    let mut removed = 0u64;
-    for entry in entries.flatten() {
-        let is_stale = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= SESSION_TTL);
-        if is_stale && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
+    let removed = super::remove_stale_temp_files(&dir, SESSION_TTL);
     if removed > 0 {
         tracing::info!(removed, dir = %dir.display(), "Cleaned up stale Docker upload temp files");
     }
@@ -619,26 +652,7 @@ const PROXY_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(4
 /// Logs warnings on errors but never panics — cleanup is best-effort.
 pub fn cleanup_proxy_temp_dir(data_dir: &str) {
     let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-proxy");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "Failed to read proxy temp directory for cleanup");
-            return;
-        }
-    };
-    let mut removed = 0u64;
-    for entry in entries.flatten() {
-        let is_stale = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= PROXY_TEMP_MAX_AGE);
-        if is_stale && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
+    let removed = super::remove_stale_temp_files(&dir, PROXY_TEMP_MAX_AGE);
     if removed > 0 {
         tracing::info!(removed, dir = %dir.display(), "Cleaned up stale proxy temp files");
     }
@@ -673,6 +687,8 @@ fn resolve_quarantine(state: &AppState) -> (crate::digest_quarantine::Quarantine
         .or(state.config.curation.quarantine_ttl.as_deref())
         .unwrap_or("14d");
 
+    // Config validation refuses a TTL that does not parse (#1099); the default only
+    // covers a config built without it.
     let secs = crate::curation::parse_duration(ttl_str).unwrap_or(14 * 86400);
     (mode, secs)
 }
@@ -1292,7 +1308,7 @@ async fn download_blob(
             &headers,
             crate::curation::RegistryType::Docker,
             &name,
-            Some(&digest),
+            crate::curation::RequestVersion::Known(digest.to_string()),
             None,
         ) {
             return response;
@@ -1329,8 +1345,13 @@ async fn download_blob(
         vec![name.clone(), format!("library/{}", name)]
     };
 
+    // One record per upstream, across both names it may be asked under.
+    let mut misses: Vec<UpstreamMiss> = upstreams_to_try
+        .iter()
+        .map(|_| UpstreamMiss::default())
+        .collect();
     for try_name in &names_to_try {
-        for upstream in &upstreams_to_try {
+        for (upstream, miss) in upstreams_to_try.iter().zip(misses.iter_mut()) {
             // Content-addressed: the URL digest is the hash the spool verifies before
             // storing, so the curation integrity check runs on it before upstream is
             // opened — a rejection must not strand a circuit-breaker probe.
@@ -1390,6 +1411,7 @@ async fn download_blob(
                             return response;
                         }
                         // The fill failed and its slot is released: take another turn.
+                        miss.record(&ProxyError::Network("shared fill failed".into()));
                     }
                     None => match failure {
                         Some(FillStartError::Spool) => {
@@ -1400,6 +1422,7 @@ async fn download_blob(
                         }
                         Some(FillStartError::Upstream(e)) => {
                             tracing::debug!(error = ?e, upstream = %upstream.url, name = %try_name, "Docker blob proxy fetch failed, trying next");
+                            miss.record(&e);
                             break;
                         }
                         None => break,
@@ -1409,10 +1432,11 @@ async fn download_blob(
         }
     }
 
-    if !state.config.docker.upstreams.is_empty() {
-        tracing::warn!(registry = "docker", name = %name, digest = %digest, "Proxy failed, returning 404");
+    let mut miss = UpstreamMiss::default();
+    for asked in &misses {
+        miss.record_upstream(asked);
     }
-    StatusCode::NOT_FOUND.into_response()
+    miss.response("docker", &format!("{name}@{digest}"))
 }
 
 /// 201 for a blob that is now present in `name`, in the shape `upload_blob`
@@ -1992,12 +2016,13 @@ async fn upload_blob(
 async fn try_fetch_and_cache(
     state: &AppState,
     upstreams: &[&crate::config::DockerUpstream],
+    misses: &mut [UpstreamMiss],
     upstream_name: &str,
     name: &str,
     reference: &str,
     cache_key: &str,
 ) -> Option<Response> {
-    for upstream in upstreams {
+    for (upstream, miss) in upstreams.iter().zip(misses.iter_mut()) {
         tracing::debug!(upstream_url = %upstream.url, upstream_name = %upstream_name, "Trying upstream");
         match fetch_manifest_from_upstream(
             &state.http_client,
@@ -2085,6 +2110,7 @@ async fn try_fetch_and_cache(
                 let reference_clone = reference.to_string();
                 let digest_clone = digest.clone();
                 let repo_index = Arc::clone(&state.repo_index);
+                let state_clone = state.clone();
                 tokio::spawn(async move {
                     // Store manifest by tag and digest (namespaced)
                     if let Err(e) = storage.put(&key_clone, &data_clone).await {
@@ -2104,23 +2130,34 @@ async fn try_fetch_and_cache(
 
                     // Extract and save metadata
                     let metadata = extract_metadata(&data_clone, &storage, &name_clone).await;
+                    // The manifest is stored first; its metadata goes under the metadata lock, so
+                    // a pull's statistics on this copy cannot write over it.
                     if let Ok(meta_json) = serde_json::to_vec(&metadata) {
-                        let meta_key = manifest_meta_key(
+                        if let Err(e) = write_manifest_meta(
+                            &state_clone,
                             upstream_ns.as_deref(),
                             &name_clone,
                             &reference_clone,
-                        );
-                        if let Err(e) = storage.put(&meta_key, &meta_json).await {
-                            tracing::warn!(key = %meta_key, error = %e, "cache write failed (metadata by tag)");
+                            &meta_json,
+                        )
+                        .await
+                        {
+                            tracing::warn!(name = %name_clone, reference = %reference_clone, error = %e, "cache write failed (metadata by tag)");
                             crate::metrics::CACHE_WRITE_ERRORS
                                 .with_label_values(&["docker", "metadata"])
                                 .inc();
                         }
 
-                        let digest_meta_key =
-                            manifest_meta_key(upstream_ns.as_deref(), &name_clone, &digest_clone);
-                        if let Err(e) = storage.put(&digest_meta_key, &meta_json).await {
-                            tracing::warn!(key = %digest_meta_key, error = %e, "cache write failed (metadata by digest)");
+                        if let Err(e) = write_manifest_meta(
+                            &state_clone,
+                            upstream_ns.as_deref(),
+                            &name_clone,
+                            &digest_clone,
+                            &meta_json,
+                        )
+                        .await
+                        {
+                            tracing::warn!(name = %name_clone, digest = %digest_clone, error = %e, "cache write failed (metadata by digest)");
                             crate::metrics::CACHE_WRITE_ERRORS
                                 .with_label_values(&["docker", "metadata"])
                                 .inc();
@@ -2134,7 +2171,7 @@ async fn try_fetch_and_cache(
             Err(ProxyError::CircuitOpen(reg)) => return Some(circuit_open_response(&reg)),
             Err(e) => {
                 tracing::debug!(error = ?e, upstream = %upstream.url, name = %upstream_name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
-                continue;
+                miss.record(&e);
             }
         }
     }
@@ -2207,7 +2244,7 @@ async fn get_manifest(
             &headers,
             crate::curation::RegistryType::Docker,
             &name,
-            Some(&reference),
+            crate::curation::RequestVersion::Known(reference.to_string()),
             publish_date,
         ) {
             return response;
@@ -2246,6 +2283,9 @@ async fn get_manifest(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    // A served copy's pull statistics live beside it: a bare-key (hosted) hit counts against
+    // the pushed image's own metadata, a namespaced hit against the proxied copy's.
+    let served_ns = if hosted { None } else { ns.as_deref() };
     // Digest references are immutable (content-addressed) → the cache is authoritative forever.
     // Tag references on PROXIED copies are MUTABLE: a tag can be re-pushed to point at a
     // different manifest, so a proxied tag must be revalidated against upstream before it is
@@ -2279,7 +2319,7 @@ async fn get_manifest(
     // Serve fresh cache immediately
     if let Some(ref data) = cached {
         if cache_fresh {
-            return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
+            return serve_cached_manifest(&state, data, &name, &reference, served_ns);
         }
     }
 
@@ -2291,7 +2331,7 @@ async fn get_manifest(
     // lookups on locally-hosted images.
     if internal {
         if let Some(ref data) = cached {
-            return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
+            return serve_cached_manifest(&state, data, &name, &reference, served_ns);
         }
         crate::metrics::record_namespace_isolation_refused("docker");
         return manifest_unknown_response(&name, &reference);
@@ -2302,8 +2342,21 @@ async fn get_manifest(
         upstreams_count = upstreams_to_try.len(),
         "Trying upstream proxies"
     );
-    if let Some(response) =
-        try_fetch_and_cache(&state, &upstreams_to_try, &name, &name, &reference, &key).await
+    // One record per upstream, across both names it may be asked under (library/ below).
+    let mut misses: Vec<UpstreamMiss> = upstreams_to_try
+        .iter()
+        .map(|_| UpstreamMiss::default())
+        .collect();
+    if let Some(response) = try_fetch_and_cache(
+        &state,
+        &upstreams_to_try,
+        &mut misses,
+        &name,
+        &name,
+        &reference,
+        &key,
+    )
+    .await
     {
         return response;
     }
@@ -2315,6 +2368,7 @@ async fn get_manifest(
         if let Some(response) = try_fetch_and_cache(
             &state,
             &upstreams_to_try,
+            &mut misses,
             &library_name,
             &name,
             &reference,
@@ -2335,8 +2389,7 @@ async fn get_manifest(
                 reference = %reference,
                 "Upstream failed, serving stale cached manifest"
             );
-            let mut response =
-                serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
+            let mut response = serve_cached_manifest(&state, data, &name, &reference, served_ns);
             response.headers_mut().insert(
                 axum::http::header::HeaderName::from_static("x-nora-stale"),
                 axum::http::header::HeaderValue::from_static("true"),
@@ -2349,10 +2402,11 @@ async fn get_manifest(
         }
     }
 
-    if !state.config.docker.upstreams.is_empty() {
-        tracing::warn!(registry = "docker", name = %name, reference = %reference, "Proxy failed, returning 404");
+    let mut miss = UpstreamMiss::default();
+    for asked in &misses {
+        miss.record_upstream(asked);
     }
-    StatusCode::NOT_FOUND.into_response()
+    miss.response("docker", &format!("{name}:{reference}"))
 }
 
 /// Serve a manifest from local cache with all required headers and side-effects.
@@ -2398,15 +2452,17 @@ fn serve_cached_manifest(
     // Detect manifest media type from content
     let content_type = detect_manifest_media_type(data);
 
-    // Update metadata (downloads, last_pulled) in background
-    let meta_key = manifest_meta_key(ns, name, reference);
-    let state_clone = state.clone();
-    let storage_clone = state.storage.clone();
-    tokio::spawn(update_metadata_on_pull(
-        state_clone,
-        storage_clone,
-        meta_key,
-    ));
+    // Count the pull OFF the request path (#1114): bump the in-memory
+    // accumulator instead of rewriting `.meta.json`. A background task flushes
+    // it to a `.stats.json` sidecar. No spawn, no publish lock, no storage write
+    // here — so the request-path publish-date read never races a pull.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    state
+        .pull_stats
+        .record(&manifest_meta_key(ns, name, reference), now);
 
     manifest_response(Bytes::copy_from_slice(data), content_type, digest)
 }
@@ -2530,19 +2586,17 @@ async fn put_manifest(
 
     // Extract and save metadata
     let metadata = extract_metadata(&body, &state.storage, &name).await;
-    let meta_key = format!("docker/{}/manifests/{}.meta.json", name, reference);
     if let Ok(meta_json) = serde_json::to_vec(&metadata) {
-        if let Err(e) = state.storage.put(&meta_key, &meta_json).await {
-            tracing::warn!(key = %meta_key, error = %e, "cache write failed (push metadata by tag)");
+        if let Err(e) = write_manifest_meta(&state, None, &name, &reference, &meta_json).await {
+            tracing::warn!(name = %name, reference = %reference, error = %e, "cache write failed (push metadata by tag)");
             crate::metrics::CACHE_WRITE_ERRORS
                 .with_label_values(&["docker", "metadata"])
                 .inc();
         }
 
         // Also save metadata by digest
-        let digest_meta_key = format!("docker/{}/manifests/{}.meta.json", name, digest);
-        if let Err(e) = state.storage.put(&digest_meta_key, &meta_json).await {
-            tracing::warn!(key = %digest_meta_key, error = %e, "cache write failed (push metadata by digest)");
+        if let Err(e) = write_manifest_meta(&state, None, &name, &digest, &meta_json).await {
+            tracing::warn!(name = %name, digest = %digest, error = %e, "cache write failed (push metadata by digest)");
             crate::metrics::CACHE_WRITE_ERRORS
                 .with_label_values(&["docker", "metadata"])
                 .inc();
@@ -2630,6 +2684,83 @@ async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> R
 // Delete handlers (Docker Registry V2 spec)
 // ============================================================================
 
+// ── Manifest metadata (`*.meta.json`) ──────────────────────────────────────────────
+//
+// Only the functions in this section build a metadata key — `manifest_meta_key`'s callers are
+// `write_manifest_meta`, `delete_manifest_and_meta`, `update_metadata_on_pull` and the reader
+// `extract_docker_publish_date` (checked by `only_the_metadata_section_builds_metadata_keys`).
+// They keep one order:
+// - a manifest is written and deleted under its own lock (push, delete); its metadata under the
+//   metadata lock, taken after the manifest's and never the other way round;
+// - a manifest is deleted before its metadata, and its metadata only once it is gone;
+// - a pull's statistics take only the metadata lock and write only while the manifest is stored.
+
+/// Write a manifest's metadata (push, proxy fill) under the metadata lock: a pull's statistics
+/// that read the file before this write cannot write the old contents back over it. A push
+/// calls it while holding the manifest's lock.
+async fn write_manifest_meta(
+    state: &AppState,
+    ns: Option<&str>,
+    name: &str,
+    reference: &str,
+    json: &[u8],
+) -> crate::storage::Result<()> {
+    let key = manifest_meta_key(ns, name, reference);
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
+    state.storage.put(&key, json).await
+}
+
+/// Delete a manifest — the namespaced copy and the bare one (`both`), or the namespaced copy
+/// and, when it is missing, the bare one — and then, once the manifest is gone, its metadata
+/// (namespaced and bare), each under the metadata lock. The caller holds the manifest's lock.
+/// Returns the manifest delete's result.
+async fn delete_manifest_and_meta(
+    state: &AppState,
+    ns: Option<&str>,
+    name: &str,
+    reference: &str,
+    both: bool,
+) -> crate::storage::Result<()> {
+    let key = manifest_key(ns, name, reference);
+    let legacy_key = manifest_key(None, name, reference);
+    let result = if both {
+        let first = state.storage.delete(&key).await;
+        if legacy_key == key {
+            first
+        } else {
+            let second = state.storage.delete(&legacy_key).await;
+            match (first, second) {
+                (Ok(()), _) | (_, Ok(())) => Ok(()),
+                (Err(e), _) => Err(e),
+            }
+        }
+    } else {
+        match state.storage.delete(&key).await {
+            Err(crate::storage::StorageError::NotFound) if key != legacy_key => {
+                state.storage.delete(&legacy_key).await
+            }
+            other => other,
+        }
+    };
+    // Metadata goes only once the manifest is gone (deleted now, or not there at all).
+    if matches!(result, Ok(()) | Err(crate::storage::StorageError::NotFound)) {
+        let mut meta_keys = vec![manifest_meta_key(ns, name, reference)];
+        if ns.is_some() {
+            meta_keys.push(manifest_meta_key(None, name, reference));
+        }
+        for meta_key in meta_keys {
+            let lock = state.publish_lock(&meta_key);
+            let _guard = lock.lock().await;
+            let _ = state.storage.delete(&meta_key).await;
+            // #1114: drop the pull-stats sidecar under the same lock, so a
+            // concurrent flush cannot leave a stale .stats.json for a gone manifest.
+            let _ = state.storage.delete(&manifest_stats_key(&meta_key)).await;
+        }
+    }
+    result
+}
+
 /// Delete every tag manifest that resolves to `digest` (#658).
 ///
 /// NORA stores a tag and its digest as independent files, so deleting a manifest
@@ -2676,16 +2807,7 @@ async fn delete_tags_for_digest(state: &AppState, ns: Option<&str>, name: &str, 
         if resolved != digest {
             continue;
         }
-        let _ = state.storage.delete(&key).await;
-        let _ = state.storage.delete(&legacy_key).await;
-        let _ = state
-            .storage
-            .delete(&manifest_meta_key(ns, name, &tag))
-            .await;
-        let _ = state
-            .storage
-            .delete(&manifest_meta_key(None, name, &tag))
-            .await;
+        let _ = delete_manifest_and_meta(state, ns, name, &tag, true).await;
         tracing::info!(
             name = %name, tag = %tag, digest = %digest,
             "Docker tag removed because its manifest was deleted by digest (#658)"
@@ -2724,23 +2846,8 @@ async fn delete_manifest(
         if let Ok(data) = storage_get_with_fallback(&state.storage, &key, &legacy_key).await {
             use sha2::Digest;
             let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
-            // Delete from both namespaced and legacy locations
-            let _ = state
-                .storage
-                .delete(&manifest_key(ns.as_deref(), &name, &digest))
-                .await;
-            let _ = state
-                .storage
-                .delete(&manifest_key(None, &name, &digest))
-                .await;
-            let _ = state
-                .storage
-                .delete(&manifest_meta_key(ns.as_deref(), &name, &digest))
-                .await;
-            let _ = state
-                .storage
-                .delete(&manifest_meta_key(None, &name, &digest))
-                .await;
+            // Delete from both namespaced and legacy locations, then the metadata.
+            let _ = delete_manifest_and_meta(&state, ns.as_deref(), &name, &digest, true).await;
         }
     } else {
         // #658: deleting by digest must also drop the tags that resolve to it,
@@ -2748,17 +2855,9 @@ async fn delete_manifest(
         delete_tags_for_digest(&state, ns.as_deref(), &name, &reference).await;
     }
 
-    // Delete manifest — try namespaced key first, then legacy fallback
-    match state.storage.delete(&key).await {
+    // Delete manifest — try namespaced key first, then legacy fallback — then its metadata.
+    match delete_manifest_and_meta(&state, ns.as_deref(), &name, &reference, false).await {
         Ok(()) => {
-            // Delete associated metadata
-            let meta_key = manifest_meta_key(ns.as_deref(), &name, &reference);
-            let _ = state
-                .storage
-                .delete(&manifest_meta_key(None, &name, &reference))
-                .await;
-            let _ = state.storage.delete(&meta_key).await;
-
             state.audit.log(AuditEntry::new(
                 "delete",
                 "api",
@@ -2769,28 +2868,6 @@ async fn delete_manifest(
             state.repo_index.invalidate("docker");
             tracing::info!(name = %name, reference = %reference, "Docker manifest deleted");
             StatusCode::ACCEPTED.into_response()
-        }
-        Err(crate::storage::StorageError::NotFound) if key != legacy_key => {
-            // Try legacy (non-namespaced) key
-            match state.storage.delete(&legacy_key).await {
-                Ok(()) => {
-                    let _ = state
-                        .storage
-                        .delete(&manifest_meta_key(None, &name, &reference))
-                        .await;
-                    state.audit.log(AuditEntry::new(
-                        "delete",
-                        "api",
-                        &format!("{}:{}", name, reference),
-                        "docker",
-                        "manifest",
-                    ));
-                    state.repo_index.invalidate("docker");
-                    tracing::info!(name = %name, reference = %reference, "Docker manifest deleted (legacy key)");
-                    StatusCode::ACCEPTED.into_response()
-                }
-                _ => manifest_unknown_response(&name, &reference),
-            }
         }
         Err(crate::storage::StorageError::NotFound) => manifest_unknown_response(&name, &reference),
         Err(e) => {
@@ -3626,7 +3703,10 @@ pub async fn open_blob_from_upstream(
         "Proxy blob download started"
     );
 
-    let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
+    let cb_key = upstream_key(
+        crate::registry_type::RegistryType::Docker.as_str(),
+        upstream_url,
+    );
     let probe = cb.check(&cb_key)?;
 
     let source = BlobSource {
@@ -3649,8 +3729,12 @@ pub async fn open_blob_from_upstream(
             cb.record_failure(&cb_key, probe);
             return Err(ProxyError::Network(reason));
         }
-        // Auth issue (token fetch failed), not upstream down
-        Err(e @ BlobRequestError::Token) => return Err(e.into()),
+        // The registry answered (401) and the token server gave no token: an auth
+        // issue, not the registry down — alive, as on resume (`FillFailure::Refused`).
+        Err(e @ BlobRequestError::Token) => {
+            cb.record_alive(&cb_key, probe);
+            return Err(e.into());
+        }
     };
 
     if !response.status().is_success() {
@@ -3680,6 +3764,20 @@ pub async fn open_blob_from_upstream(
 const UPSTREAM_RESUME_ATTEMPTS: u32 = 5;
 /// Pause before resume attempt `n` is `n` times this.
 const UPSTREAM_RESUME_BACKOFF: Duration = Duration::from_millis(500);
+
+/// A spool write failed on the local disk. The upstream answered and was sending the
+/// body, so the probe goes back as alive: counting our disk against the upstream would
+/// open its breaker, and dropping the probe would hold the half-open slot (#585).
+fn spool_write_failed(
+    cb: &CircuitBreakerRegistry,
+    cb_key: &str,
+    probe: ProbeToken,
+    op: &str,
+    e: std::io::Error,
+) -> ProxyError {
+    cb.record_alive(cb_key, probe);
+    ProxyError::Network(format!("temp file {op}: {e}"))
+}
 
 /// Stream an opened upstream blob to its spool file with a per-chunk `read_timeout` and
 /// incremental SHA-256. Never accumulates the blob in RAM. Each chunk is flushed before
@@ -3736,14 +3834,14 @@ pub(crate) async fn spool_upstream_blob(
                     }
                     stalls = 0;
                     hasher.update(&chunk);
-                    file.write_all(&chunk)
-                        .await
-                        .map_err(|e| ProxyError::Network(format!("temp file write: {}", e)))?;
+                    if let Err(e) = file.write_all(&chunk).await {
+                        return Err(spool_write_failed(cb, &cb_key, probe, "write", e));
+                    }
                     bytes_written += chunk.len() as u64;
                     if let Some(progress) = progress {
-                        file.flush()
-                            .await
-                            .map_err(|e| ProxyError::Network(format!("temp file flush: {}", e)))?;
+                        if let Err(e) = file.flush().await {
+                            return Err(spool_write_failed(cb, &cb_key, probe, "flush", e));
+                        }
                         progress.send_modify(|s| s.written = bytes_written);
                     }
                 }
@@ -3793,9 +3891,9 @@ pub(crate) async fn spool_upstream_blob(
         };
     }
     debug_assert_eq!(skip, 0, "a finished fill has no bytes left to skip");
-    file.flush()
-        .await
-        .map_err(|e| ProxyError::Network(format!("temp file flush: {}", e)))?;
+    if let Err(e) = file.flush().await {
+        return Err(spool_write_failed(cb, &cb_key, probe, "flush", e));
+    }
     drop(file);
     let sha256 = hex::encode(sha2::Digest::finalize(hasher));
     cb.record_success(&cb_key, probe);
@@ -3830,6 +3928,9 @@ pub async fn fetch_blob_from_upstream(
     cb: &CircuitBreakerRegistry,
     temp_dir: &std::path::Path,
 ) -> Result<FetchedBlob, ProxyError> {
+    // The spool first, as in `start_fill`: once `open_blob_from_upstream` takes a
+    // circuit-breaker probe, the only exits left are the ones the spool records.
+    let spool = SpoolFile::create(temp_dir).await?;
     let blob = open_blob_from_upstream(
         client,
         upstream_url,
@@ -3841,7 +3942,6 @@ pub async fn fetch_blob_from_upstream(
         cb,
     )
     .await?;
-    let spool = SpoolFile::create(temp_dir).await?;
     spool_upstream_blob(blob, spool, read_timeout, cb, None).await
 }
 
@@ -3858,7 +3958,10 @@ pub async fn fetch_manifest_from_upstream(
     basic_auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
 ) -> Result<(Vec<u8>, String), ProxyError> {
-    let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
+    let cb_key = upstream_key(
+        crate::registry_type::RegistryType::Docker.as_str(),
+        upstream_url,
+    );
     let probe = cb.check(&cb_key)?;
 
     let url = format!(
@@ -3920,7 +4023,9 @@ pub async fn fetch_manifest_from_upstream(
                 })?
         } else {
             tracing::error!("Failed to acquire token");
-            // Auth issue (token fetch failed), not upstream down
+            // The registry answered (401) and the token server gave no token: an auth
+            // issue, not the registry down — alive, so the probe is returned.
+            cb.record_alive(&cb_key, probe);
             return Err(ProxyError::Network("token fetch failed".into()));
         }
     } else {
@@ -4176,36 +4281,120 @@ async fn get_config_info(
     (os, arch, variant)
 }
 
-/// Update metadata when a manifest is pulled
-/// Increments download counter and updates last_pulled timestamp
-async fn update_metadata_on_pull(state: AppState, storage: Storage, meta_key: String) {
-    // Lock to prevent lost counter increments from concurrent pulls
-    let lock = state.publish_lock(&meta_key);
-    let _guard = lock.lock().await;
+/// How often the background task folds accumulated pull counts into the
+/// sidecars (#1114). Soft state: a crash loses at most this much (accepted).
+pub(crate) const PULL_STATS_FLUSH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(45);
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+/// Fold accumulated pull counts into their `.stats.json` sidecars every
+/// `interval`, and once more on shutdown, so a hard crash loses at most one
+/// interval of counts. Extracted from `main` (with the interval injected) so a
+/// test can drive the tick path (not only the shutdown path): the loss bound
+/// depends on the tick flush running, not just the final flush on cancel (#1114).
+pub(crate) async fn pull_stats_flush_loop(state: AppState, interval: std::time::Duration) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        // CANCEL-SAFETY: both arms are cancel-safe (an interval tick and a
+        // cancellation token). On shutdown we run one final flush, then stop.
+        tokio::select! {
+            _ = tick.tick() => {
+                flush_pull_stats(&state).await;
+            }
+            _ = state.cancel_token.cancelled() => {
+                flush_pull_stats(&state).await;
+                break;
+            }
+        }
+    }
+}
 
-    // Try to read existing metadata
-    let mut metadata = if let Ok(data) = storage.get(&meta_key).await {
-        serde_json::from_slice::<ImageMetadata>(&data).unwrap_or_default()
-    } else {
-        ImageMetadata::default()
-    };
+/// Cumulative pull statistics for one manifest, stored in a `.stats.json`
+/// sidecar beside its `.meta.json` (#1114). Kept out of `.meta.json` so a pull
+/// never rewrites the integrity metadata a concurrent request reads.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub(crate) struct StatsSidecar {
+    pub downloads: u64,
+    pub last_pulled: u64,
+}
 
-    // Update pull stats
-    metadata.downloads += 1;
-    metadata.last_pulled = now;
+/// The `.stats.json` sidecar key for a manifest's `.meta.json` key.
+fn manifest_stats_key(meta_key: &str) -> String {
+    let base = meta_key.strip_suffix(".meta.json").unwrap_or(meta_key);
+    format!("{base}.stats.json")
+}
 
-    // Save back
-    if let Ok(json) = serde_json::to_vec(&metadata) {
-        if let Err(e) = storage.put(&meta_key, &json).await {
-            tracing::warn!(key = %meta_key, error = %e, "cache write failed (pull stats update)");
-            crate::metrics::CACHE_WRITE_ERRORS
-                .with_label_values(&["docker", "metadata"])
-                .inc();
+/// Cumulative stats for a manifest: the `.stats.json` sidecar if present, else
+/// the legacy counts still in a pre-V3 `.meta.json` (migrated on the next flush),
+/// else zero.
+async fn read_cumulative_stats(storage: &Storage, meta_key: &str) -> StatsSidecar {
+    let stats_key = manifest_stats_key(meta_key);
+    if let Ok(data) = storage.get(&stats_key).await {
+        if let Ok(s) = serde_json::from_slice::<StatsSidecar>(&data) {
+            return s;
+        }
+    }
+    // Migration: a manifest pushed before V3 still carries counts in .meta.json.
+    if let Ok(data) = storage.get(meta_key).await {
+        if let Ok(m) = serde_json::from_slice::<ImageMetadata>(&data) {
+            return StatsSidecar {
+                downloads: m.downloads,
+                last_pulled: m.last_pulled,
+            };
+        }
+    }
+    StatsSidecar::default()
+}
+
+/// Current pull stats for the UI and reports: the flushed cumulative value plus
+/// the un-flushed in-memory delta.
+pub(crate) async fn current_pull_stats(state: &AppState, meta_key: &str) -> StatsSidecar {
+    let base = read_cumulative_stats(&state.storage, meta_key).await;
+    let delta = state.pull_stats.peek(meta_key);
+    StatsSidecar {
+        downloads: base.downloads + delta.downloads,
+        last_pulled: base.last_pulled.max(delta.last_pulled),
+    }
+}
+
+/// Drain the pull-stats accumulator and fold each delta into its `.stats.json`
+/// sidecar (#1114). Keeps the deleted-manifest guard of the old per-pull
+/// writer: a delta for a manifest no longer stored is dropped, never
+/// resurrecting its stats. Replaces the per-pull `.meta.json` rewrite.
+pub(crate) async fn flush_pull_stats(state: &AppState) {
+    for (meta_key, delta) in state.pull_stats.drain() {
+        if delta.downloads == 0 && delta.last_pulled == 0 {
+            continue;
+        }
+        // Serialize with push/delete on this manifest, as the old per-pull writer
+        // did: take the publish lock, THEN re-check the manifest is stored, so a
+        // delete that landed since the pull cannot be undone by writing a stale
+        // sidecar after it (the sidecar is removed under the same lock on delete).
+        let lock = state.publish_lock(&meta_key);
+        let _guard = lock.lock().await;
+        // The manifest blob key is the meta key with `.meta.json` → `.json`
+        // (what `manifest_key` builds); stripping only `.meta.json` would check
+        // `…/<ref>` and always miss, so the guard would skip every flush and the
+        // sidecar would never be written (the stats would be silently lost).
+        let manifest_key = format!(
+            "{}.json",
+            meta_key.strip_suffix(".meta.json").unwrap_or(&meta_key)
+        );
+        // Deleted-manifest guard: never resurrect a gone manifest's stats.
+        if state.storage.stat(&manifest_key).await.is_none() {
+            continue;
+        }
+        let mut stats = read_cumulative_stats(&state.storage, &meta_key).await;
+        stats.downloads += delta.downloads;
+        stats.last_pulled = stats.last_pulled.max(delta.last_pulled);
+        let stats_key = manifest_stats_key(&meta_key);
+        if let Ok(json) = serde_json::to_vec(&stats) {
+            if let Err(e) = state.storage.put(&stats_key, &json).await {
+                tracing::warn!(key = %stats_key, error = %e, "pull-stats sidecar write failed");
+                crate::metrics::CACHE_WRITE_ERRORS
+                    .with_label_values(&["docker", "stats"])
+                    .inc();
+            }
         }
     }
 }
@@ -4351,6 +4540,7 @@ mod tests {
 
     #[test]
     fn test_max_upload_sessions_default() {
+        let _lock = crate::test_env::env_lock();
         // Without env var set, should return default
         let max = max_upload_sessions();
         assert!(max > 0);
@@ -4396,53 +4586,63 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn test_upload_session_limit_returns_oci_429() {
+    #[test]
+    fn test_upload_session_limit_returns_oci_429() {
+        // The handler reads the limit from env while the request runs, so the lock is
+        // held across the whole request; a runtime of its own keeps that off an `.await`.
+        let _lock = crate::test_env::env_lock();
         use crate::test_helpers::{body_bytes, create_test_context, send};
 
-        // Pre-fill the session map to the ceiling — no env mutation, so this is
-        // safe under parallel tests.
-        let ctx = create_test_context();
-        {
-            let mut sessions = ctx.state.upload_sessions.write();
-            for i in 0..max_upload_sessions() {
-                sessions.insert(
-                    format!("fill-{i}"),
-                    UploadSession {
-                        temp_path: std::env::temp_dir().join(format!("fill-{i}")),
-                        size: 0,
-                        name: "alpine".to_string(),
-                        created_at: std::time::Instant::now(),
-                    },
-                );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Pre-fill the session map to the ceiling — no env mutation, so this is
+            // safe under parallel tests.
+            let ctx = create_test_context();
+            {
+                let mut sessions = ctx.state.upload_sessions.write();
+                for i in 0..max_upload_sessions() {
+                    sessions.insert(
+                        format!("fill-{i}"),
+                        UploadSession {
+                            temp_path: std::env::temp_dir().join(format!("fill-{i}")),
+                            size: 0,
+                            name: "alpine".to_string(),
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+                }
             }
-        }
-        let resp = send(
-            &ctx.app,
-            Method::POST,
-            "/v2/alpine/blobs/uploads/",
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            resp.headers()[header::CONTENT_TYPE].to_str().unwrap(),
-            "application/json"
-        );
-        assert!(
-            resp.headers().contains_key(header::RETRY_AFTER),
-            "429 must carry Retry-After so clients back off"
-        );
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(body["errors"][0]["code"], "TOOMANYREQUESTS");
-        assert_eq!(
-            body["errors"][0]["detail"]["limit"],
-            max_upload_sessions() as u64
-        );
+            let resp = send(
+                &ctx.app,
+                Method::POST,
+                "/v2/alpine/blobs/uploads/",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                resp.headers()[header::CONTENT_TYPE].to_str().unwrap(),
+                "application/json"
+            );
+            assert!(
+                resp.headers().contains_key(header::RETRY_AFTER),
+                "429 must carry Retry-After so clients back off"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(body["errors"][0]["code"], "TOOMANYREQUESTS");
+            assert_eq!(
+                body["errors"][0]["detail"]["limit"],
+                max_upload_sessions() as u64
+            );
+        });
     }
 
     #[test]
     fn test_max_session_size_default() {
+        let _lock = crate::test_env::env_lock();
         let max = max_session_size();
         assert_eq!(max, DEFAULT_MAX_SESSION_SIZE_MB * 1024 * 1024);
     }
@@ -4786,6 +4986,93 @@ mod integration_tests {
         assert_eq!(body.as_ref(), manifest_bytes.as_slice());
     }
 
+    /// A cold miss is "not found" only when an upstream said so: a manifest or blob whose
+    /// every upstream failed is 502. One upstream answering "not found" decides 404 while
+    /// another is down. Docker Hub answers a single-segment name (`alpine`) with a 4xx and
+    /// serves it as `library/alpine`, so that 4xx does not make the image missing while
+    /// `library/alpine` failed.
+    #[tokio::test]
+    async fn a_cold_miss_is_404_only_when_an_upstream_said_not_found() {
+        use crate::config::DockerUpstream;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let hub_down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/v2/library/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&hub_down)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&hub_down)
+            .await;
+        let refused = "http://127.0.0.1:9".to_string();
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        let manifest = "/v2/myorg/app/manifests/1.0".to_string();
+        let layer = format!("/v2/myorg/app/blobs/{blob}");
+        let official = "/v2/alpine/manifests/3".to_string();
+        let official_layer = format!("/v2/alpine/blobs/{blob}");
+
+        for (upstreams, uri, want) in [
+            (vec![down.uri()], &manifest, StatusCode::BAD_GATEWAY),
+            (vec![refused.clone()], &manifest, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], &manifest, StatusCode::NOT_FOUND),
+            (
+                vec![down.uri(), missing.uri()],
+                &manifest,
+                StatusCode::NOT_FOUND,
+            ),
+            (vec![down.uri()], &layer, StatusCode::BAD_GATEWAY),
+            (vec![refused.clone()], &layer, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], &layer, StatusCode::NOT_FOUND),
+            (
+                vec![down.uri(), missing.uri()],
+                &layer,
+                StatusCode::NOT_FOUND,
+            ),
+            (vec![hub_down.uri()], &official, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], &official, StatusCode::NOT_FOUND),
+            (
+                vec![hub_down.uri()],
+                &official_layer,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (vec![missing.uri()], &official_layer, StatusCode::NOT_FOUND),
+        ] {
+            let entries = upstreams.clone();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = entries
+                    .into_iter()
+                    .map(|url| DockerUpstream {
+                        url,
+                        auth: None,
+                        namespace: None,
+                        prefix: None,
+                    })
+                    .collect();
+            });
+            let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), want, "{uri} {upstreams:?}");
+        }
+        assert!(!down.received_requests().await.unwrap().is_empty());
+        assert!(!missing.received_requests().await.unwrap().is_empty());
+        let hub = hub_down.received_requests().await.unwrap();
+        assert!(hub
+            .iter()
+            .any(|r| r.url.path().starts_with("/v2/library/alpine/")));
+    }
+
     /// A locally pushed manifest is authoritative: with global pull-through upstreams
     /// configured, GET must serve it without revalidating against upstream — an unreachable
     /// upstream must neither 404 the tag (serve_stale = false) nor stale-mark it.
@@ -4840,6 +5127,603 @@ mod integration_tests {
         );
         let body = body_bytes(resp).await;
         assert_eq!(body.as_ref(), manifest_bytes.as_slice());
+    }
+
+    /// A pull of a locally pushed image counts against that image. With an upstream configured
+    /// every name resolves to the upstream's namespace, but a hosted manifest is served from its
+    /// bare key, and its pull statistics go to the pushed manifest's own metadata — by tag and
+    /// by digest — with nothing written under the namespace.
+    #[tokio::test]
+    async fn a_hosted_pull_counts_against_the_pushed_image() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+                namespace: Some("docker.io".into()),
+                prefix: None,
+            }];
+        });
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(&manifest_bytes))
+        );
+        seed_zero_config(&ctx.state, "hosted-img").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/hosted-img/manifests/v1",
+            Body::from(manifest_bytes),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        let pushed_at = |state: crate::AppState| async move {
+            super::extract_docker_publish_date(
+                &state.storage,
+                "hosted-img",
+                "v1",
+                false,
+                Some("docker.io"),
+            )
+            .await
+        };
+        let date = pushed_at(ctx.state.clone()).await;
+        assert!(date.is_some(), "a pushed image has a publish date");
+
+        for uri in [
+            "/v2/hosted-img/manifests/v1".to_string(),
+            "/v2/hosted-img/manifests/v1".to_string(),
+            format!("/v2/hosted-img/manifests/{digest}"),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
+
+        // #1114: pull stats live in the in-memory accumulator (flushed to a
+        // .stats.json sidecar), read via current_pull_stats. record() runs
+        // synchronously on the GET path, so the counts are already visible.
+        let downloads = |key: String| {
+            let state = ctx.state.clone();
+            async move { Some(super::current_pull_stats(&state, &key).await.downloads) }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let by_tag = downloads("docker/hosted-img/manifests/v1.meta.json".into()).await;
+            let by_digest =
+                downloads(format!("docker/hosted-img/manifests/{digest}.meta.json")).await;
+            if by_tag == Some(2) && by_digest == Some(1) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pushed image's own metadata: by tag {by_tag:?}, by digest {by_digest:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let elsewhere = ctx.state.storage.list("docker/docker.io/").await.unwrap();
+        assert!(
+            elsewhere.is_empty(),
+            "written under the namespace: {elsewhere:?}"
+        );
+        // Curation still reads the push date after the pulls.
+        assert_eq!(pushed_at(ctx.state.clone()).await, date);
+    }
+
+    /// #1114: a manifest pull must NOT rewrite its `.meta.json`. Pull statistics
+    /// (downloads, last_pulled) are accumulated off the request path and flushed in
+    /// batches to a separate sidecar, so the integrity-relevant `.meta.json` that a
+    /// concurrent request reads (`extract_docker_publish_date`) is never rewritten by
+    /// a pull — the source of the false INTEGRITY VIOLATION on healthy data (33-41
+    /// per 100 GETs on 1.3.5). RED before V3: `update_metadata_on_pull` rewrites the
+    /// `.meta.json` on every GET (downloads += 1, last_pulled = now).
+    #[tokio::test]
+    async fn a_pull_does_not_rewrite_the_manifest_meta_json() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        seed_zero_config(&ctx.state, "stable-img").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/stable-img/manifests/v1",
+            Body::from(manifest_bytes),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let meta_key = "docker/stable-img/manifests/v1.meta.json";
+        let before = ctx
+            .state
+            .storage
+            .get(meta_key)
+            .await
+            .expect("meta written at push");
+
+        for _ in 0..5 {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                "/v2/stable-img/manifests/v1",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        // Give any off-request-path stats work time to land before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let after = ctx
+            .state
+            .storage
+            .get(meta_key)
+            .await
+            .expect("meta still present");
+        assert_eq!(
+            before, after,
+            "a pull rewrote the manifest .meta.json (stats must go to the off-path sidecar, not the integrity meta)"
+        );
+    }
+
+    /// #1114: the same holds under the real trigger — a herd of parallel pulls
+    /// of one manifest (the docker proxy's thundering herd). On 1.3.5 each pull's
+    /// off-path stats write raced the others and the request-path publish-date read,
+    /// logging INTEGRITY VIOLATION on healthy data (19 even from one client pulling
+    /// back-to-back). A batched off-path sidecar leaves `.meta.json` byte-identical
+    /// no matter how many concurrent pulls land.
+    #[tokio::test]
+    async fn concurrent_pulls_do_not_rewrite_the_manifest_meta_json() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        seed_zero_config(&ctx.state, "herd-img").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/herd-img/manifests/v1",
+            Body::from(manifest_bytes),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let meta_key = "docker/herd-img/manifests/v1.meta.json";
+        let before = ctx
+            .state
+            .storage
+            .get(meta_key)
+            .await
+            .expect("meta written at push");
+
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let app = ctx.app.clone();
+            handles.push(tokio::spawn(async move {
+                send(
+                    &app,
+                    Method::GET,
+                    "/v2/herd-img/manifests/v1",
+                    Body::empty(),
+                )
+                .await
+                .status()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), StatusCode::OK);
+        }
+        // Let any off-request-path stats work settle before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let after = ctx
+            .state
+            .storage
+            .get(meta_key)
+            .await
+            .expect("meta still present");
+        assert_eq!(
+            before, after,
+            "concurrent pulls rewrote the manifest .meta.json"
+        );
+    }
+
+    /// #1114 unit: the pull-stats accumulator counts, peeks the un-flushed
+    /// delta, keeps last_pulled as the max seen, and drains to empty.
+    #[test]
+    fn pull_stats_accumulator_counts_peeks_and_drains() {
+        let acc = super::PullStatsAccumulator::default();
+        acc.record("k1", 100);
+        acc.record("k1", 200);
+        acc.record("k2", 150);
+        assert_eq!(
+            acc.peek("k1"),
+            super::PullDelta {
+                downloads: 2,
+                last_pulled: 200
+            }
+        );
+        assert_eq!(
+            acc.peek("k2"),
+            super::PullDelta {
+                downloads: 1,
+                last_pulled: 150
+            }
+        );
+        assert_eq!(acc.peek("absent"), super::PullDelta::default());
+
+        let mut drained = acc.drain();
+        drained.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            drained,
+            vec![
+                (
+                    "k1".to_string(),
+                    super::PullDelta {
+                        downloads: 2,
+                        last_pulled: 200
+                    }
+                ),
+                (
+                    "k2".to_string(),
+                    super::PullDelta {
+                        downloads: 1,
+                        last_pulled: 150
+                    }
+                ),
+            ]
+        );
+        assert_eq!(acc.peek("k1"), super::PullDelta::default());
+        assert!(acc.drain().is_empty());
+
+        // last_pulled is the max seen, never regressed by a later-but-smaller now.
+        acc.record("k1", 50);
+        acc.record("k1", 40);
+        assert_eq!(
+            acc.peek("k1"),
+            super::PullDelta {
+                downloads: 2,
+                last_pulled: 50
+            }
+        );
+    }
+
+    /// Minimal hosted manifest for the flush tests: push `stable-img:v1`, return
+    /// its meta key. Mirrors the push the other V3 tests use.
+    async fn push_stable_img(ctx: &crate::test_helpers::TestContext) -> &'static str {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        seed_zero_config(&ctx.state, "stable-img").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/stable-img/manifests/v1",
+            Body::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        "docker/stable-img/manifests/v1.meta.json"
+    }
+
+    /// #1114 (M5): the flush LOOP persists on an interval tick, not only on
+    /// shutdown. Without the tick flush a crash loses every count since start,
+    /// not "at most one interval" as the soft-state contract promises. A short
+    /// interval drives a real tick; the assert is taken before any cancellation,
+    /// so a loop that flushes only on shutdown fails it.
+    #[tokio::test]
+    async fn a_flush_loop_tick_persists_the_sidecar_before_shutdown() {
+        let ctx = create_test_context();
+        let meta_key = push_stable_img(&ctx).await;
+        ctx.state.pull_stats.record(meta_key, 100);
+        let handle = tokio::spawn(super::pull_stats_flush_loop(
+            ctx.state.clone(),
+            std::time::Duration::from_millis(10),
+        ));
+        let stats_key = "docker/stable-img/manifests/v1.stats.json";
+        let mut persisted = false;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if ctx.state.storage.get(stats_key).await.is_ok() {
+                persisted = true;
+                break;
+            }
+        }
+        ctx.state.cancel_token.cancel();
+        let _ = handle.await;
+        assert!(
+            persisted,
+            "a tick must flush the sidecar before any shutdown (the loss bound depends on it)"
+        );
+    }
+
+    /// #1114 positive control: a flush actually PERSISTS the stats to the
+    /// `.stats.json` sidecar for a live manifest (the guard must find the
+    /// manifest at `…/v1.json`, not `…/v1`). This is the control that was
+    /// missing — without it the flush guard was vacuous and the stats were
+    /// silently dropped. RED if the flush never writes the sidecar.
+    #[tokio::test]
+    async fn a_flush_persists_the_pull_stats_sidecar() {
+        let ctx = create_test_context();
+        let meta_key = push_stable_img(&ctx).await;
+        let stats_key = "docker/stable-img/manifests/v1.stats.json";
+
+        for _ in 0..3 {
+            let r = send(
+                &ctx.app,
+                Method::GET,
+                "/v2/stable-img/manifests/v1",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        // Batched: nothing in the sidecar until a flush runs.
+        assert!(
+            ctx.state.storage.get(stats_key).await.is_err(),
+            "sidecar must not exist before a flush"
+        );
+
+        super::flush_pull_stats(&ctx.state).await;
+
+        let raw = ctx
+            .state
+            .storage
+            .get(stats_key)
+            .await
+            .expect("flush must persist the .stats.json sidecar");
+        let sidecar: super::StatsSidecar = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(sidecar.downloads, 3, "three pulls persisted");
+        assert!(sidecar.last_pulled > 0, "last_pulled persisted");
+        // current_pull_stats equals the flushed value (accumulator drained).
+        assert_eq!(
+            super::current_pull_stats(&ctx.state, meta_key)
+                .await
+                .downloads,
+            3
+        );
+    }
+
+    /// (M8, M12): the read path SUMS the flushed count and the pending delta;
+    /// a later flush ADVANCES last_pulled past the flushed value.
+    #[tokio::test]
+    async fn read_sums_pending_and_flush_advances_last_pulled() {
+        let ctx = create_test_context();
+        let meta_key = push_stable_img(&ctx).await;
+        ctx.state.pull_stats.record(meta_key, 100);
+        ctx.state.pull_stats.record(meta_key, 100);
+        super::flush_pull_stats(&ctx.state).await;
+        ctx.state.pull_stats.record(meta_key, 200);
+        assert_eq!(
+            super::current_pull_stats(&ctx.state, meta_key)
+                .await
+                .downloads,
+            3
+        );
+        super::flush_pull_stats(&ctx.state).await;
+        let raw = ctx
+            .state
+            .storage
+            .get("docker/stable-img/manifests/v1.stats.json")
+            .await
+            .unwrap();
+        let s: super::StatsSidecar = serde_json::from_slice(&raw).unwrap();
+        assert_eq!((s.downloads, s.last_pulled), (3, 200));
+    }
+
+    /// #1114: legacy counts in a pre-V3 `.meta.json` are migrated into the
+    /// sidecar on the first flush — not lost, and not re-migrated (doubled) on
+    /// later flushes (the sidecar becomes authoritative once written).
+    #[tokio::test]
+    async fn flush_migrates_legacy_meta_counts_once() {
+        let ctx = create_test_context();
+        let meta_key = push_stable_img(&ctx).await;
+        let stats_key = "docker/stable-img/manifests/v1.stats.json";
+
+        // Seed a pre-V3 .meta.json carrying 5 downloads.
+        let mut m: super::ImageMetadata =
+            serde_json::from_slice(&ctx.state.storage.get(meta_key).await.unwrap()).unwrap();
+        m.downloads = 5;
+        m.last_pulled = 1_000;
+        ctx.state
+            .storage
+            .put(meta_key, &serde_json::to_vec(&m).unwrap())
+            .await
+            .unwrap();
+
+        let pull = || async {
+            let r = send(
+                &ctx.app,
+                Method::GET,
+                "/v2/stable-img/manifests/v1",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+        };
+
+        pull().await;
+        super::flush_pull_stats(&ctx.state).await;
+        let read = |k: &'static str| {
+            let st = ctx.state.storage.clone();
+            async move {
+                serde_json::from_slice::<super::StatsSidecar>(&st.get(k).await.unwrap()).unwrap()
+            }
+        };
+        assert_eq!(
+            read(stats_key).await.downloads,
+            6,
+            "legacy 5 migrated + 1 new, not lost"
+        );
+
+        pull().await;
+        super::flush_pull_stats(&ctx.state).await;
+        assert_eq!(
+            read(stats_key).await.downloads,
+            7,
+            "second flush adds 1 to the sidecar, does not re-migrate the legacy 5"
+        );
+    }
+
+    /// A pull leaves the push date curation reads where it was, even when the
+    /// pull comes long after the push (the date is seeded in the past, so a pull that
+    /// rewrote it cannot match by landing in the same second).
+    #[tokio::test]
+    async fn a_later_pull_keeps_the_push_date() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+                namespace: Some("docker.io".into()),
+                prefix: None,
+            }];
+        });
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        seed_zero_config(&ctx.state, "aged-img").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/aged-img/manifests/v1",
+            Body::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        let meta_key = "docker/aged-img/manifests/v1.meta.json";
+        let mut meta: super::ImageMetadata =
+            serde_json::from_slice(&ctx.state.storage.get(meta_key).await.unwrap()).unwrap();
+        meta.push_timestamp = 1_000_000;
+        ctx.state
+            .storage
+            .put(meta_key, &serde_json::to_vec(&meta).unwrap())
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/aged-img/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let downloads = Some(
+                super::current_pull_stats(&ctx.state, meta_key)
+                    .await
+                    .downloads,
+            );
+            if downloads == Some(1) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "downloads {downloads:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let date = super::extract_docker_publish_date(
+            &ctx.state.storage,
+            "aged-img",
+            "v1",
+            false,
+            Some("docker.io"),
+        )
+        .await;
+        assert_eq!(date, Some(1_000_000));
+    }
+
+    /// Control for the test above: a proxied copy, served from its namespaced key, keeps
+    /// counting against that copy's metadata, not against a bare (hosted) key.
+    #[tokio::test]
+    async fn a_proxied_pull_counts_against_the_proxied_copy() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+                namespace: Some("docker.io".into()),
+                prefix: None,
+            }];
+        });
+        let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#;
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(manifest)));
+        let key = super::manifest_key(Some("docker.io"), "library/proxied", &digest);
+        ctx.state.storage.put(&key, manifest).await.unwrap();
+
+        let uri = format!("/v2/library/proxied/manifests/{digest}");
+        for _ in 0..2 {
+            let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let meta_key = super::manifest_meta_key(Some("docker.io"), "library/proxied", &digest);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let downloads = Some(
+                super::current_pull_stats(&ctx.state, &meta_key)
+                    .await
+                    .downloads,
+            );
+            if downloads == Some(2) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "proxied copy's metadata: {downloads:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let bare = super::manifest_meta_key(None, "library/proxied", &digest);
+        assert!(ctx.state.storage.stat(&bare).await.is_none(), "{bare}");
     }
 
     /// Provenance invariant that #868's hosted/proxied inference depends on: a local push
@@ -7587,7 +8471,8 @@ mod upstream_resume_tests {
     }
 
     /// Headers that never come are still bounded by `proxy_timeout` (not worse than
-    /// before): the pull fails over instead of hanging.
+    /// before): the pull fails over instead of hanging, with 502 — the upstream failed,
+    /// it did not say the blob is missing.
     #[tokio::test]
     async fn missing_headers_are_bounded_by_proxy_timeout() {
         let (blob, digest) = layer(1024);
@@ -7604,7 +8489,7 @@ mod upstream_resume_tests {
 
         let started = std::time::Instant::now();
         let response = pull(&ctx, &digest).await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert!(
             started.elapsed() < Duration::from_secs(4),
             "headers wait took {:?}, proxy_timeout is 1s",
@@ -7815,7 +8700,7 @@ mod upstream_resume_tests {
         while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(10) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let cb_key = format!("docker:{url}");
+        let cb_key = crate::circuit_breaker::upstream_key("docker", &url);
         assert!(
             ctx.state.circuit_breaker.check(&cb_key).is_ok(),
             "a refused resume must not open the registry's breaker"
@@ -8235,5 +9120,1676 @@ mod blob_single_flight_tests {
         assert!(cached(&ctx, &digest).await);
         assert_eq!(body_of(pull(&ctx, &digest).await).await.unwrap(), blob);
         assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod breaker_probe_tests {
+    //! Every exit of a Docker upstream fetch that took a circuit-breaker probe reports
+    //! it back, so a half-open breaker never waits out the #585 stall recovery behind a
+    //! probe nobody returned. A refused token is the registry answering (alive), and a
+    //! failed local spool write says nothing against the upstream (alive, not a failure).
+    use super::{
+        fetch_blob_from_upstream, fetch_manifest_from_upstream, open_blob_from_upstream,
+        spool_upstream_blob, SpoolFile, SpoolStatus,
+    };
+    use crate::circuit_breaker::{upstream_key, CircuitBreakerRegistry, ProbeToken};
+    use crate::config::CircuitBreakerConfig;
+    use crate::registry::docker_auth::DockerAuth;
+    use crate::registry::TempFileGuard;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const NAME: &str = "library/alpine";
+    const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// A breaker whose next `check` for `upstream` is the half-open probe. Reset is 1 h,
+    /// so the #585 stall recovery cannot hand the slot back during a test.
+    fn half_open_cb(upstream: &str) -> (CircuitBreakerRegistry, String) {
+        let cb = CircuitBreakerRegistry::new(CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold: 1,
+            reset_timeout: 3600,
+            overrides: std::collections::HashMap::new(),
+        });
+        let key = upstream_key("docker", upstream);
+        cb.record_failure(&key, ProbeToken::BACKGROUND);
+        cb.expire_open_for_test(&key);
+        (cb, key)
+    }
+
+    fn status(cb: &CircuitBreakerRegistry, key: &str) -> &'static str {
+        let snapshot = cb.health_snapshot("docker").unwrap();
+        assert!(cb.keys().iter().any(|k| k == key));
+        snapshot.status
+    }
+
+    /// An upstream whose blob and manifest endpoints answer 401 with a bearer challenge,
+    /// and whose token endpoint fails: the token server gives no token.
+    async fn upstream_without_token() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let challenge = format!("Bearer realm=\"{}/token\",service=\"test\"", server.uri());
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v2/.*/(blobs|manifests)/"))
+            .respond_with(ResponseTemplate::new(401).insert_header("www-authenticate", challenge))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn blob_open_without_token_returns_the_probe_as_alive() {
+        let server = upstream_without_token().await;
+        let (cb, key) = half_open_cb(&server.uri());
+        let auth = DockerAuth::default();
+        let opened = open_blob_from_upstream(
+            &reqwest::Client::new(),
+            &server.uri(),
+            NAME,
+            DIGEST,
+            &auth,
+            5,
+            None,
+            &cb,
+        )
+        .await;
+        assert!(opened.is_err(), "no token, no blob");
+        assert_eq!(
+            status(&cb, &key),
+            "closed",
+            "the registry answered (401): the probe proves it alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_without_token_returns_the_probe_as_alive() {
+        let server = upstream_without_token().await;
+        let (cb, key) = half_open_cb(&server.uri());
+        let auth = DockerAuth::default();
+        let fetched = fetch_manifest_from_upstream(
+            &reqwest::Client::new(),
+            &server.uri(),
+            NAME,
+            "latest",
+            &auth,
+            5,
+            None,
+            &cb,
+        )
+        .await;
+        assert!(fetched.is_err(), "no token, no manifest");
+        assert_eq!(
+            status(&cb, &key),
+            "closed",
+            "the registry answered (401): the probe proves it alive"
+        );
+    }
+
+    /// Open the blob as the half-open probe against an upstream that sends `pieces` (a
+    /// pause before each), then spool it into a handle that cannot be written (opened
+    /// read-only), so the local write fails while the upstream is healthy.
+    async fn spool_into_unwritable(
+        pieces: &[&[u8]],
+        progress: bool,
+    ) -> (CircuitBreakerRegistry, String) {
+        let total: usize = pieces.iter().map(|p| p.len()).sum();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let (cb, key) = half_open_cb(&upstream);
+        let serve_once = async {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req).await;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {total}\r\n\r\n");
+            let _ = sock.write_all(head.as_bytes()).await;
+            for piece in pieces {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = sock.write_all(piece).await;
+                let _ = sock.flush().await;
+            }
+            // Hold the connection until the client is done with it.
+            let _ = sock.read(&mut req).await;
+        };
+        let fill = async {
+            let auth = DockerAuth::default();
+            let blob = open_blob_from_upstream(
+                &reqwest::Client::new(),
+                &upstream,
+                NAME,
+                DIGEST,
+                &auth,
+                5,
+                None,
+                &cb,
+            )
+            .await
+            .unwrap();
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("spool");
+            std::fs::write(&path, b"").unwrap();
+            let spool = SpoolFile {
+                path: path.clone(),
+                file: tokio::fs::File::open(&path).await.unwrap(),
+                guard: TempFileGuard::new(path),
+            };
+            let (tx, _rx) = tokio::sync::watch::channel(SpoolStatus::default());
+            let outcome = spool_upstream_blob(blob, spool, 5, &cb, progress.then_some(&tx)).await;
+            assert!(outcome.is_err(), "the spool write must fail");
+        };
+        tokio::join!(serve_once, fill);
+        (cb, key)
+    }
+
+    #[tokio::test]
+    async fn spool_write_error_returns_the_probe_as_alive() {
+        let (cb, key) = spool_into_unwritable(&[b"first-chunk", b"second-chunk"], false).await;
+        assert_eq!(
+            status(&cb, &key),
+            "closed",
+            "a failed local write is not the upstream's failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn spool_progress_flush_error_returns_the_probe_as_alive() {
+        let (cb, key) = spool_into_unwritable(&[b"only-chunk"], true).await;
+        assert_eq!(
+            status(&cb, &key),
+            "closed",
+            "a failed local flush is not the upstream's failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn spool_final_flush_error_returns_the_probe_as_alive() {
+        let (cb, key) = spool_into_unwritable(&[b"only-chunk"], false).await;
+        assert_eq!(
+            status(&cb, &key),
+            "closed",
+            "a failed local flush is not the upstream's failure"
+        );
+    }
+
+    /// The spool file is local: when it cannot be created, no probe may have been taken
+    /// yet and the upstream is not asked at all.
+    #[tokio::test]
+    async fn fetch_blob_without_a_spool_takes_no_probe() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"blob".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (cb, key) = half_open_cb(&server.uri());
+        let missing = tempfile::TempDir::new().unwrap().path().join("no-such-dir");
+        let auth = DockerAuth::default();
+        let fetched = fetch_blob_from_upstream(
+            &reqwest::Client::new(),
+            &server.uri(),
+            NAME,
+            DIGEST,
+            &auth,
+            5,
+            5,
+            None,
+            &cb,
+            &missing,
+        )
+        .await;
+        assert!(fetched.is_err(), "no spool, no fetch");
+        assert!(
+            cb.check(&key).is_ok(),
+            "no probe may be held: the next request must be allowed to probe"
+        );
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_cases {
+    use crate::config::DockerUpstream;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// one upstream asked under `alpine` (fails) and `library/alpine` (4xx): it failed
+    /// under one name, so it did not say "not found" — 502 for manifest and blob.
+    #[tokio::test]
+    async fn failed_under_plain_name_404_under_library_is_502() {
+        let flip = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/v2/library/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&flip)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&flip)
+            .await;
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        for uri in [
+            "/v2/alpine/manifests/3".to_string(),
+            format!("/v2/alpine/blobs/{blob}"),
+        ] {
+            let url = flip.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = vec![DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                }];
+            });
+            let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{uri}");
+        }
+        let asked = flip.received_requests().await.unwrap();
+        assert!(asked
+            .iter()
+            .any(|r| r.url.path().starts_with("/v2/library/alpine/")));
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_edge_cases {
+    use crate::config::DockerUpstream;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Any 4xx is an answer — an upstream answering 400 for a manifest or a
+    /// blob said "not here", so 404, not 502.
+    #[tokio::test]
+    async fn upstream_400_is_404() {
+        let bad = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&bad)
+            .await;
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        for uri in [
+            "/v2/myorg/app/manifests/1.0".to_string(),
+            format!("/v2/myorg/app/blobs/{blob}"),
+        ] {
+            let url = bad.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = vec![DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                }];
+            });
+            let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+}
+
+/// A hosted pull's statistics and a re-push write the same metadata file: the pull's write
+/// is held after its read, a re-push lands, then the held write is released — the push date
+/// curation reads must be the re-push's, not the first push's.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod hosted_pull_stats_and_re_push {
+    use crate::storage::{FileMeta, ObjectStorage, Result, StorageBackend};
+    use crate::Storage;
+    use axum::body::Bytes;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    struct HeldPut {
+        inner: ObjectStorage,
+        key: String,
+        armed: AtomicBool,
+        reached: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for HeldPut {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+            if key == self.key && self.armed.swap(false, Ordering::SeqCst) {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.put(key, data, sha256).await
+        }
+        async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+            self.inner.get(key).await
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<FileMeta> {
+            self.inner.stat(key).await
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            0
+        }
+        fn backend_name(&self) -> &'static str {
+            "held-put"
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+    }
+
+    /// Push long ago, then (optionally) a pull whose statistics write is held, a re-push,
+    /// release. Returns the push date curation reads afterwards.
+    async fn push_date_after_re_push(with_pull: bool) -> i64 {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+                namespace: Some("docker.io".into()),
+                prefix: None,
+            }];
+        });
+        let meta_key = "docker/race-img/manifests/v1.meta.json";
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let backend = Arc::new(HeldPut {
+            inner: ObjectStorage::in_memory(),
+            key: meta_key.to_string(),
+            armed: AtomicBool::new(false),
+            reached: Arc::clone(&reached),
+            release: Arc::clone(&release),
+        });
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(backend.clone());
+
+        let manifest = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {
+                    "mediaType": "application/vnd.docker.container.image.v1+json",
+                    "size": 0,
+                    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                "layers": []
+            }))
+            .unwrap(),
+        );
+        state
+            .storage
+            .put(
+                "docker/race-img/blobs/sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                b"x",
+            )
+            .await
+            .unwrap();
+        let push = |state: crate::AppState, body: Bytes| async move {
+            super::put_manifest(
+                State(state),
+                Path(("race-img".to_string(), "v1".to_string())),
+                body,
+            )
+            .await
+            .status()
+        };
+        assert_eq!(
+            push(state.clone(), manifest.clone()).await,
+            StatusCode::CREATED
+        );
+        // The first push was long ago.
+        let mut meta: super::ImageMetadata =
+            serde_json::from_slice(&state.storage.get(meta_key).await.unwrap()).unwrap();
+        meta.push_timestamp = 1_000_000;
+        state
+            .storage
+            .put(meta_key, &serde_json::to_vec(&meta).unwrap())
+            .await
+            .unwrap();
+
+        if with_pull {
+            // V3: the pull records in-memory and never writes .meta.json, so it
+            // cannot clobber the publish date curation reads.
+            let pull = super::get_manifest(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Path(("race-img".to_string(), "v1".to_string())),
+            )
+            .await;
+            assert_eq!(pull.status(), StatusCode::OK);
+        }
+
+        // A re-push sets the new date; a flush then touches only the .stats.json sidecar.
+        let repush = push(state.clone(), manifest.clone()).await;
+        assert_eq!(repush, StatusCode::CREATED);
+        super::flush_pull_stats(&state).await;
+
+        super::extract_docker_publish_date(
+            &state.storage,
+            "race-img",
+            "v1",
+            false,
+            Some("docker.io"),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_re_push_during_a_pull_keeps_the_re_push_date() {
+        let date = push_date_after_re_push(true).await;
+        assert!(
+            date > 1_000_000,
+            "curation reads the first push's date after a re-push: {date}"
+        );
+    }
+
+    /// Control: without a pull the re-push's date is what curation reads.
+    #[tokio::test]
+    async fn control_a_re_push_alone_sets_the_push_date() {
+        assert!(push_date_after_re_push(false).await > 1_000_000);
+    }
+
+    /// A delete while a pull's statistics write is held: once both are done, no metadata of
+    /// the deleted manifest is left behind (the pull's write must not land after the delete).
+    #[tokio::test]
+    async fn a_delete_during_a_pull_leaves_no_metadata() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+                namespace: Some("docker.io".into()),
+                prefix: None,
+            }];
+        });
+        let meta_key = "docker/race-img/manifests/v1.meta.json";
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let backend = Arc::new(HeldPut {
+            inner: ObjectStorage::in_memory(),
+            key: meta_key.to_string(),
+            armed: AtomicBool::new(false),
+            reached: Arc::clone(&reached),
+            release: Arc::clone(&release),
+        });
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(backend.clone());
+        state
+            .storage
+            .put(
+                "docker/race-img/blobs/sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                b"x",
+            )
+            .await
+            .unwrap();
+        let manifest = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {
+                    "mediaType": "application/vnd.docker.container.image.v1+json",
+                    "size": 0,
+                    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                "layers": []
+            }))
+            .unwrap(),
+        );
+        let pushed = super::put_manifest(
+            State(state.clone()),
+            Path(("race-img".to_string(), "v1".to_string())),
+            manifest,
+        )
+        .await;
+        assert_eq!(pushed.status(), StatusCode::CREATED);
+
+        // V3: the pull records in-memory (no storage write); the manifest is then
+        // deleted; a later flush must honour the deleted-manifest guard and
+        // resurrect neither the .meta.json nor the .stats.json. The held-put arming
+        // (backend.armed / reached / release) is left unused — the pull no longer
+        // writes, so there is nothing to hold.
+        let pull = super::get_manifest(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Path(("race-img".to_string(), "v1".to_string())),
+        )
+        .await;
+        assert_eq!(pull.status(), StatusCode::OK);
+
+        let delete = super::delete_manifest(
+            State(state.clone()),
+            Path(("race-img".to_string(), "v1".to_string())),
+        )
+        .await;
+        assert_eq!(delete.status(), StatusCode::ACCEPTED);
+        super::flush_pull_stats(&state).await;
+        // The flush never writes .meta.json: the metadata the delete removed stays
+        // removed. On this backend (in-memory + an upstream namespace) the bare
+        // manifest survives the delete through a separate pre-existing gap, so the
+        // flush legitimately persists the .stats.json sidecar (the manifest is
+        // still stored); the no-resurrect guard for a truly-gone manifest is
+        // covered on the local backend by delete_during_pull and
+        // a_pull_stats_task_after_the_delete_leaves_no_metadata.
+        assert!(
+            state.storage.stat(meta_key).await.is_none(),
+            "the deleted manifest's .meta.json was written back by the flush"
+        );
+    }
+}
+
+/// Every writer and deleter of a manifest's metadata takes the lock a hosted pull's statistics
+/// take: a delete by tag or by digest, a re-push, the legacy key, a mixed-case tag. Each test holds
+/// one side between its read and its write while the other runs.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod hosted_pull_stats_every_writer_takes_the_lock {
+    use crate::config::DockerUpstream;
+    use crate::storage::{FileMeta, ObjectStorage, Result, StorageBackend};
+    use crate::Storage;
+    use axum::body::Bytes;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    const BLOB: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// Holds the next put and/or the next delete of one key until released.
+    struct Held {
+        inner: Arc<dyn StorageBackend>,
+        key: String,
+        hold_put: AtomicBool,
+        put_reached: Notify,
+        put_release: Notify,
+        hold_delete: AtomicBool,
+        del_reached: Notify,
+        del_release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for Held {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+            if key == self.key && self.hold_put.swap(false, Ordering::SeqCst) {
+                self.put_reached.notify_one();
+                self.put_release.notified().await;
+            }
+            self.inner.put(key, data, sha256).await
+        }
+        async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+            self.inner.get(key).await
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            if key == self.key && self.hold_delete.swap(false, Ordering::SeqCst) {
+                self.del_reached.notify_one();
+                self.del_release.notified().await;
+            }
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<FileMeta> {
+            self.inner.stat(key).await
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            0
+        }
+        fn backend_name(&self) -> &'static str {
+            "held"
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+    }
+
+    struct Fx {
+        _ctx: crate::test_helpers::TestContext,
+        _dir: Option<tempfile::TempDir>,
+        state: crate::AppState,
+        held: Arc<Held>,
+        manifest: Bytes,
+        digest: String,
+    }
+
+    /// Upstream with namespace docker.io configured (so a hosted pull is a bare-key hit);
+    /// `local` = LocalStorage (delete of a missing key is NotFound) instead of in-memory.
+    async fn fx(local: bool, held_key: impl Fn(&str) -> String) -> Fx {
+        use crate::test_helpers::create_test_context_with_config;
+        use sha2::Digest as _;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+                namespace: Some("docker.io".into()),
+                prefix: None,
+            }];
+        });
+        let manifest = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {
+                    "mediaType": "application/vnd.docker.container.image.v1+json",
+                    "size": 0,
+                    "digest": BLOB
+                },
+                "layers": []
+            }))
+            .unwrap(),
+        );
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&manifest)));
+        let (dir, inner): (Option<tempfile::TempDir>, Arc<dyn StorageBackend>) = if local {
+            let d = tempfile::tempdir().unwrap();
+            let s = crate::storage::LocalStorage::new(d.path().to_str().unwrap());
+            (Some(d), Arc::new(s))
+        } else {
+            (None, Arc::new(ObjectStorage::in_memory()))
+        };
+        let held = Arc::new(Held {
+            inner,
+            key: held_key(&digest),
+            hold_put: AtomicBool::new(false),
+            put_reached: Notify::new(),
+            put_release: Notify::new(),
+            hold_delete: AtomicBool::new(false),
+            del_reached: Notify::new(),
+            del_release: Notify::new(),
+        });
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(held.clone());
+        state
+            .storage
+            .put(&format!("docker/race-img/blobs/{BLOB}"), b"x")
+            .await
+            .unwrap();
+        Fx {
+            _ctx: ctx,
+            _dir: dir,
+            state,
+            held,
+            manifest,
+            digest,
+        }
+    }
+
+    async fn push(state: crate::AppState, tag: String, body: Bytes) -> StatusCode {
+        super::put_manifest(State(state), Path(("race-img".to_string(), tag)), body)
+            .await
+            .status()
+    }
+
+    async fn pull(state: &crate::AppState, reference: &str) {
+        let r = super::get_manifest(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Path(("race-img".to_string(), reference.to_string())),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    async fn reached(n: &Notify, what: &str) {
+        // CANCEL-SAFETY: a timed-out wait drops only the notification future; expect fails.
+        tokio::time::timeout(Duration::from_secs(5), n.notified())
+            .await
+            .expect(what);
+    }
+
+    async fn set_push_ts(state: &crate::AppState, key: &str, ts: u64) {
+        let mut m: super::ImageMetadata =
+            serde_json::from_slice(&state.storage.get(key).await.unwrap()).unwrap();
+        m.push_timestamp = ts;
+        state
+            .storage
+            .put(key, &serde_json::to_vec(&m).unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn date(state: &crate::AppState, reference: &str) -> Option<i64> {
+        super::extract_docker_publish_date(
+            &state.storage,
+            "race-img",
+            reference,
+            false,
+            Some("docker.io"),
+        )
+        .await
+    }
+
+    /// Pull (stats write held) ‖ delete `delete_ref`; the held key must be gone afterwards.
+    async fn delete_during_pull(f: &Fx, pull_ref: &str, delete_ref: &str) {
+        let key = f.held.key.clone();
+        assert_eq!(
+            push(f.state.clone(), "v1".into(), f.manifest.clone()).await,
+            StatusCode::CREATED
+        );
+        assert!(f.state.storage.stat(&key).await.is_some());
+        // V3: the pull records in-memory (no storage write); the manifest is then
+        // deleted; a later flush must honour the deleted-manifest guard and
+        // resurrect neither the .meta.json nor the .stats.json of a gone manifest.
+        pull(&f.state, pull_ref).await;
+        let del = super::delete_manifest(
+            State(f.state.clone()),
+            Path(("race-img".to_string(), delete_ref.to_string())),
+        )
+        .await;
+        assert_eq!(del.status(), StatusCode::ACCEPTED);
+        super::flush_pull_stats(&f.state).await;
+        assert!(
+            f.state.storage.stat(&key).await.is_none(),
+            "metadata {key} of the deleted manifest was written back"
+        );
+        assert!(
+            f.state
+                .storage
+                .stat(&super::manifest_stats_key(&key))
+                .await
+                .is_none(),
+            "the stats sidecar of the deleted manifest was written back"
+        );
+    }
+
+    /// M02: pull by digest ‖ delete by tag — the digest's metadata must not survive.
+    #[tokio::test]
+    async fn a_delete_by_tag_during_a_digest_pull_leaves_no_metadata() {
+        let f = fx(false, |d| {
+            format!("docker/race-img/manifests/{d}.meta.json")
+        })
+        .await;
+        let d = f.digest.clone();
+        delete_during_pull(&f, &d, "v1").await;
+    }
+
+    /// M03: pull by tag ‖ delete by digest (tag dropped via delete_tags_for_digest).
+    #[tokio::test]
+    async fn a_delete_by_digest_during_a_tag_pull_leaves_no_tag_metadata() {
+        let f = fx(false, |_| "docker/race-img/manifests/v1.meta.json".into()).await;
+        let d = f.digest.clone();
+        delete_during_pull(&f, "v1", &d).await;
+    }
+
+    /// M06: LocalStorage — delete by tag takes the legacy-key branch.
+    #[tokio::test]
+    async fn a_delete_during_a_pull_on_local_storage_leaves_no_metadata() {
+        let f = fx(true, |_| "docker/race-img/manifests/v1.meta.json".into()).await;
+        delete_during_pull(&f, "v1", "v1").await;
+    }
+
+    /// Pull of `pull_ref` (stats write held) ‖ re-push of `tag`; date for `pull_ref` must be the re-push's.
+    async fn re_push_during_pull(f: &Fx, tag: &str, pull_ref: &str) {
+        let key = f.held.key.clone();
+        assert_eq!(
+            push(f.state.clone(), tag.into(), f.manifest.clone()).await,
+            StatusCode::CREATED
+        );
+        set_push_ts(&f.state, &key, 1_000_000).await;
+        // V3: the pull records in-memory and never writes .meta.json, so it cannot
+        // clobber the publish date. A re-push sets the new date; a later flush
+        // touches only the .stats.json sidecar, never the publish timestamp.
+        pull(&f.state, pull_ref).await;
+        assert_eq!(
+            push(f.state.clone(), tag.into(), f.manifest.clone()).await,
+            StatusCode::CREATED
+        );
+        super::flush_pull_stats(&f.state).await;
+        let got = date(&f.state, pull_ref).await.unwrap();
+        assert!(
+            got > 1_000_000,
+            "stale first-push date after re-push: {got}"
+        );
+    }
+
+    /// M04: pull by digest ‖ re-push — the digest's metadata keeps the re-push date.
+    #[tokio::test]
+    async fn a_re_push_during_a_digest_pull_keeps_the_re_push_date() {
+        let f = fx(false, |d| {
+            format!("docker/race-img/manifests/{d}.meta.json")
+        })
+        .await;
+        let d = f.digest.clone();
+        re_push_during_pull(&f, "v1", &d).await;
+    }
+
+    /// M08: a tag with upper-case letters — same race, lock key must be the exact meta key.
+    #[tokio::test]
+    async fn a_re_push_during_a_pull_of_a_mixed_case_tag_keeps_the_re_push_date() {
+        let f = fx(false, |_| "docker/race-img/manifests/V1.meta.json".into()).await;
+        re_push_during_pull(&f, "V1", "V1").await;
+    }
+
+    /// A pull's statistics task that starts while the delete is in flight must not read the old
+    /// metadata and write it back (that would hand the deleted push's date to curation of the
+    /// same reference): it waits for the delete's lock and then finds the manifest gone.
+    #[tokio::test]
+    async fn a_delete_holds_the_lock_until_the_metadata_is_gone() {
+        // Local storage: on an object backend with an upstream namespace the delete leaves the
+        // hosted manifest in place (a separate, older defect), and the task rightly counts it.
+        let f = fx(true, |_| "docker/race-img/manifests/v1.meta.json".into()).await;
+        let key = f.held.key.clone();
+        assert_eq!(
+            push(f.state.clone(), "v1".into(), f.manifest.clone()).await,
+            StatusCode::CREATED
+        );
+        set_push_ts(&f.state, &key, 1_000_000).await;
+        f.held.hold_delete.store(true, Ordering::SeqCst);
+        let del = tokio::spawn(super::delete_manifest(
+            State(f.state.clone()),
+            Path(("race-img".to_string(), "v1".to_string())),
+        ));
+        reached(&f.held.del_reached, "metadata delete not reached").await;
+        // V3: a pull recorded now; its flush races the in-flight delete. The flush
+        // waits on the publish lock the delete holds, then finds the manifest gone
+        // and drops the delta — the sidecar must not resurrect the deleted manifest.
+        f.state.pull_stats.record(&key, 1_700_000_000);
+        let stats = {
+            let st = f.state.clone();
+            tokio::spawn(async move {
+                super::flush_pull_stats(&st).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        f.held.del_release.notify_one();
+        assert_eq!(del.await.unwrap().status(), StatusCode::ACCEPTED);
+        stats.await.unwrap();
+        assert!(
+            f.state.storage.stat(&key).await.is_none(),
+            "the deleted manifest's metadata is back"
+        );
+        assert!(
+            f.state
+                .storage
+                .stat(&super::manifest_stats_key(&key))
+                .await
+                .is_none(),
+            "a flush resurrected the deleted manifest's stats sidecar"
+        );
+        assert_eq!(
+            date(&f.state, "v1").await,
+            None,
+            "a deleted push's date survived the delete"
+        );
+    }
+}
+
+/// A pull's statistics are recorded only while the manifest it was served from is stored: the
+/// statistics task runs at any later point, and after a delete it must not bring the deleted
+/// manifest's metadata back.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod hosted_pull_stats_after_a_delete {
+    use crate::config::DockerUpstream;
+    use axum::body::Bytes;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+
+    const BLOB: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn ctx() -> crate::test_helpers::TestContext {
+        crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+                namespace: Some("docker.io".into()),
+                prefix: None,
+            }];
+        })
+    }
+
+    async fn push_v1(state: &crate::AppState) {
+        state
+            .storage
+            .put(&format!("docker/race-img/blobs/{BLOB}"), b"x")
+            .await
+            .unwrap();
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {
+                    "mediaType": "application/vnd.docker.container.image.v1+json",
+                    "size": 0,
+                    "digest": BLOB
+                },
+                "layers": []
+            }))
+            .unwrap(),
+        );
+        let r = super::put_manifest(
+            State(state.clone()),
+            Path(("race-img".to_string(), "v1".to_string())),
+            body,
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+    }
+
+    // The pull was served (manifest read, statistics task spawned), then the delete ran first.
+    #[tokio::test]
+    async fn a_pull_stats_task_after_the_delete_leaves_no_metadata() {
+        let ctx = ctx();
+        let state = ctx.state.clone();
+        push_v1(&state).await;
+        let key = "docker/race-img/manifests/v1.meta.json".to_string();
+        let del = super::delete_manifest(
+            State(state.clone()),
+            Path(("race-img".to_string(), "v1".to_string())),
+        )
+        .await;
+        assert_eq!(del.status(), StatusCode::ACCEPTED);
+        // V3: a late pull records into the in-memory accumulator; the flush's
+        // deleted-manifest guard must drop it — neither .meta.json nor the
+        // .stats.json sidecar may reappear for a manifest that was deleted.
+        state.pull_stats.record(&key, 1_700_000_000);
+        super::flush_pull_stats(&state).await;
+        assert!(
+            state.storage.stat(&key).await.is_none(),
+            "the deleted manifest's metadata was re-created by a late pull flush"
+        );
+        assert!(
+            state
+                .storage
+                .stat(&super::manifest_stats_key(&key))
+                .await
+                .is_none(),
+            "the deleted manifest's stats sidecar was created by a late pull flush"
+        );
+    }
+}
+
+/// A manifest and its metadata keep one order: a manifest is written and deleted under its lock
+/// and its metadata under the metadata lock taken after it; a manifest goes before its metadata; a
+/// pull's statistics take only the metadata lock and write only while the manifest is stored.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod manifest_before_metadata_one_lock_order {
+    use crate::config::DockerUpstream;
+    use crate::storage::{FileMeta, ObjectStorage, Result, StorageBackend};
+    use crate::Storage;
+    use axum::body::Bytes;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    const BLOB: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    const PUT: u8 = 1;
+    const DELETE: u8 = 2;
+    const STAT: u8 = 3;
+    const TAG_MANIFEST: &str = "docker/race-img/manifests/v1.json";
+    const TAG_META: &str = "docker/race-img/manifests/v1.meta.json";
+
+    /// Holds the next armed operation (put / delete / stat-after-result) on one key.
+    struct Held {
+        inner: Arc<dyn StorageBackend>,
+        key: std::sync::Mutex<String>,
+        op: AtomicU8,
+        reached: Notify,
+        release: Notify,
+    }
+
+    impl Held {
+        fn arm(&self, op: u8, key: &str) {
+            *self.key.lock().unwrap() = key.to_string();
+            self.op.store(op, Ordering::SeqCst);
+        }
+        async fn gate(&self, op: u8, key: &str) {
+            let same = { *self.key.lock().unwrap() == key };
+            if same
+                && self
+                    .op
+                    .compare_exchange(op, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for Held {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+            self.gate(PUT, key).await;
+            self.inner.put(key, data, sha256).await
+        }
+        async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+            self.inner.get(key).await
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.gate(DELETE, key).await;
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<FileMeta> {
+            // The answer is taken first; the hold sits between the answer and its use.
+            let r = self.inner.stat(key).await;
+            self.gate(STAT, key).await;
+            r
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            0
+        }
+        fn backend_name(&self) -> &'static str {
+            "held-r2"
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+    }
+
+    struct Fx {
+        _ctx: crate::test_helpers::TestContext,
+        _dir: Option<tempfile::TempDir>,
+        state: crate::AppState,
+        held: Arc<Held>,
+        manifest: Bytes,
+        digest: String,
+    }
+
+    /// `upstream_ns`: an upstream with namespace docker.io (hosted = bare-key hit) vs none;
+    /// `local`: LocalStorage instead of in-memory.
+    async fn fx(upstream_ns: bool, local: bool) -> Fx {
+        use sha2::Digest as _;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = if upstream_ns {
+                vec![DockerUpstream {
+                    url: "http://127.0.0.1:1".into(),
+                    auth: None,
+                    namespace: Some("docker.io".into()),
+                    prefix: None,
+                }]
+            } else {
+                vec![]
+            };
+        });
+        let manifest = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {
+                    "mediaType": "application/vnd.docker.container.image.v1+json",
+                    "size": 0,
+                    "digest": BLOB
+                },
+                "layers": []
+            }))
+            .unwrap(),
+        );
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&manifest)));
+        let (dir, inner): (Option<tempfile::TempDir>, Arc<dyn StorageBackend>) = if local {
+            let d = tempfile::tempdir().unwrap();
+            let s = crate::storage::LocalStorage::new(d.path().to_str().unwrap());
+            (Some(d), Arc::new(s))
+        } else {
+            (None, Arc::new(ObjectStorage::in_memory()))
+        };
+        let held = Arc::new(Held {
+            inner,
+            key: std::sync::Mutex::new(String::new()),
+            op: AtomicU8::new(0),
+            reached: Notify::new(),
+            release: Notify::new(),
+        });
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(held.clone());
+        state
+            .storage
+            .put(&format!("docker/race-img/blobs/{BLOB}"), b"x")
+            .await
+            .unwrap();
+        assert_eq!(
+            push(state.clone(), manifest.clone()).await,
+            StatusCode::CREATED
+        );
+        Fx {
+            _ctx: ctx,
+            _dir: dir,
+            state,
+            held,
+            manifest,
+            digest,
+        }
+    }
+
+    async fn push(state: crate::AppState, body: Bytes) -> StatusCode {
+        super::put_manifest(
+            State(state),
+            Path(("race-img".to_string(), "v1".to_string())),
+            body,
+        )
+        .await
+        .status()
+    }
+
+    async fn delete(state: crate::AppState, reference: String) -> StatusCode {
+        super::delete_manifest(State(state), Path(("race-img".to_string(), reference)))
+            .await
+            .status()
+    }
+
+    async fn pull(state: &crate::AppState, reference: &str) {
+        let r = super::get_manifest(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Path(("race-img".to_string(), reference.to_string())),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    async fn reached(n: &Notify, what: &str) {
+        // CANCEL-SAFETY: a timed-out wait drops only the notification future; expect fails.
+        tokio::time::timeout(Duration::from_secs(5), n.notified())
+            .await
+            .expect(what);
+    }
+
+    async fn finishes<T>(h: tokio::task::JoinHandle<T>, what: &str) -> T {
+        // CANCEL-SAFETY: on timeout the handle is dropped (task detached) and the test fails.
+        tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .expect(what)
+            .unwrap()
+    }
+
+    async fn downloads(state: &crate::AppState, key: &str) -> Option<u64> {
+        Some(super::current_pull_stats(state, key).await.downloads)
+    }
+
+    /// The delete is held at `held_manifest`'s removal; a pull of `pull_ref` is served and its
+    /// statistics task completes meanwhile. Once the delete is done, `meta_key` must be gone.
+    async fn pull_while_manifest_delete_held(
+        f: &Fx,
+        held_manifest: &str,
+        pull_ref: &str,
+        delete_ref: &str,
+        meta_key: &str,
+    ) {
+        f.held.arm(DELETE, held_manifest);
+        let del = tokio::spawn(delete(f.state.clone(), delete_ref.to_string()));
+        reached(&f.held.reached, "manifest delete not reached").await;
+        pull(&f.state, pull_ref).await;
+        // CANCEL-SAFETY: the poll loop holds nothing across its awaits; timeout fails the test.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while downloads(&f.state, meta_key).await != Some(1) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("pull statistics not recorded while the manifest was still stored");
+        f.held.release.notify_one();
+        assert_eq!(finishes(del, "delete hung").await, StatusCode::ACCEPTED);
+        assert!(
+            f.state.storage.stat(held_manifest).await.is_none(),
+            "manifest {held_manifest} still stored"
+        );
+        assert!(
+            f.state.storage.stat(meta_key).await.is_none(),
+            "metadata {meta_key} outlived its deleted manifest"
+        );
+    }
+
+    /// delete by tag, no upstream (Ok arm): a pull during the delete leaves no tag metadata.
+    #[tokio::test]
+    async fn a_pull_during_a_tag_delete_leaves_no_tag_metadata() {
+        let f = fx(false, false).await;
+        pull_while_manifest_delete_held(&f, TAG_MANIFEST, "v1", "v1", TAG_META).await;
+    }
+
+    /// upstream namespace + local storage (legacy arm deletes the hosted manifest).
+    #[tokio::test]
+    async fn a_pull_during_a_legacy_key_delete_leaves_no_metadata() {
+        let f = fx(true, true).await;
+        pull_while_manifest_delete_held(&f, TAG_MANIFEST, "v1", "v1", TAG_META).await;
+    }
+
+    /// delete by digest drops the tag (delete_tags_for_digest) while a tag pull is served.
+    #[tokio::test]
+    async fn a_tag_pull_during_a_digest_delete_leaves_no_tag_metadata() {
+        let f = fx(false, false).await;
+        let d = f.digest.clone();
+        pull_while_manifest_delete_held(&f, TAG_MANIFEST, "v1", &d, TAG_META).await;
+    }
+
+    /// delete by tag drops the digest copy while a digest pull is served.
+    #[tokio::test]
+    async fn a_digest_pull_during_a_tag_delete_leaves_no_digest_metadata() {
+        let f = fx(false, false).await;
+        let d = f.digest.clone();
+        let dm = format!("docker/race-img/manifests/{d}.json");
+        let dmeta = format!("docker/race-img/manifests/{d}.meta.json");
+        pull_while_manifest_delete_held(&f, &dm, &d, "v1", &dmeta).await;
+    }
+
+    // ---- pull-stats sidecar: regression fixtures ----
+
+    /// (M1, M2): a FLUSH must not rewrite .meta.json either — not to mirror
+    /// the counts, not to clear migrated legacy counts.
+    #[tokio::test]
+    async fn flush_never_rewrites_the_meta_json() {
+        let f = fx(false, true).await;
+        let mut m: super::ImageMetadata =
+            serde_json::from_slice(&f.state.storage.get(TAG_META).await.unwrap()).unwrap();
+        m.downloads = 5;
+        m.last_pulled = 1_000;
+        f.state
+            .storage
+            .put(TAG_META, &serde_json::to_vec(&m).unwrap())
+            .await
+            .unwrap();
+        let before = f.state.storage.get(TAG_META).await.unwrap();
+        for _ in 0..2 {
+            pull(&f.state, "v1").await;
+            super::flush_pull_stats(&f.state).await;
+        }
+        assert_eq!(
+            downloads(&f.state, TAG_META).await,
+            Some(7),
+            "control: the flush ran and migrated"
+        );
+        assert_eq!(
+            f.state.storage.get(TAG_META).await.unwrap(),
+            before,
+            "a flush rewrote .meta.json"
+        );
+    }
+
+    /// the flush's existence answer is held; a whole delete runs; on
+    /// release the flush must not resurrect the deleted manifest's stats sidecar.
+    #[tokio::test]
+    async fn delete_while_the_flush_check_is_held_leaves_no_stats() {
+        let f = fx(false, true).await;
+        pull(&f.state, "v1").await;
+        f.held.arm(STAT, TAG_MANIFEST);
+        let flush = {
+            let st = f.state.clone();
+            tokio::spawn(async move { super::flush_pull_stats(&st).await })
+        };
+        reached(&f.held.reached, "flush existence check not reached").await;
+        let del = tokio::spawn(delete(f.state.clone(), "v1".into()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        f.held.release.notify_one();
+        finishes(flush, "flush hung").await;
+        assert_eq!(finishes(del, "delete hung").await, StatusCode::ACCEPTED);
+        assert!(f.state.storage.stat(TAG_MANIFEST).await.is_none());
+        assert!(
+            f.state
+                .storage
+                .stat(&super::manifest_stats_key(TAG_META))
+                .await
+                .is_none(),
+            "the flush resurrected the deleted manifest's stats sidecar"
+        );
+    }
+
+    /// a delete removes an ALREADY-FLUSHED sidecar; a re-push of the
+    /// same tag starts from zero, not from the deleted manifest's count.
+    #[tokio::test]
+    async fn delete_drops_the_flushed_stats_sidecar() {
+        let f = fx(false, true).await;
+        pull(&f.state, "v1").await;
+        super::flush_pull_stats(&f.state).await;
+        let sk = super::manifest_stats_key(TAG_META);
+        assert!(
+            f.state.storage.stat(&sk).await.is_some(),
+            "control: flushed"
+        );
+        assert_eq!(
+            delete(f.state.clone(), "v1".into()).await,
+            StatusCode::ACCEPTED
+        );
+        assert!(
+            f.state.storage.stat(&sk).await.is_none(),
+            "the deleted manifest's stats sidecar survived the delete"
+        );
+        assert_eq!(
+            push(f.state.clone(), f.manifest.clone()).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(downloads(&f.state, TAG_META).await, Some(0));
+    }
+
+    /// A delete that lands before a flush leaves no metadata and no stats sidecar:
+    /// the flush re-checks the manifest under the publish lock and skips a gone
+    /// one. This is the SEQUENTIAL case; the concurrent race — the flush's
+    /// existence answer held across a whole delete — is covered by
+    /// `delete_while_the_flush_check_is_held_leaves_no_stats`.
+    #[tokio::test]
+    async fn a_delete_between_the_stats_check_and_its_write_leaves_no_metadata() {
+        let f = fx(false, false).await;
+        // V3: the pull records in-memory; the flush's existence check and its
+        // sidecar write are both under the per-key publish lock (a delete takes the
+        // same lock), so a delete cannot slip between the check and the write. After
+        // a delete, a flush resurrects neither the metadata nor the stats sidecar.
+        pull(&f.state, "v1").await;
+        assert_eq!(
+            delete(f.state.clone(), "v1".into()).await,
+            StatusCode::ACCEPTED
+        );
+        super::flush_pull_stats(&f.state).await;
+        assert!(f.state.storage.stat(TAG_MANIFEST).await.is_none());
+        assert!(
+            f.state.storage.stat(TAG_META).await.is_none(),
+            "the deleted manifest's metadata was created after the delete"
+        );
+        assert!(
+            f.state
+                .storage
+                .stat(&super::manifest_stats_key(TAG_META))
+                .await
+                .is_none(),
+            "the deleted manifest's stats sidecar was created after the delete"
+        );
+    }
+
+    /// lock order manifest -> metadata. Pull stats hold the metadata lock; a re-push and a
+    /// delete of the same tag queue up; both must finish once the pull's write is released.
+    #[tokio::test]
+    async fn push_and_delete_during_a_pull_do_not_deadlock() {
+        let f = fx(false, false).await;
+        // V3: the pull records in-memory; the flush, a re-push, and a delete all
+        // take the per-key publish lock, so they serialize without a lock-order
+        // deadlock. Run them concurrently and require all three to finish.
+        pull(&f.state, "v1").await;
+        let flush = {
+            let st = f.state.clone();
+            tokio::spawn(async move { super::flush_pull_stats(&st).await })
+        };
+        let rp = tokio::spawn(push(f.state.clone(), f.manifest.clone()));
+        let del = tokio::spawn(delete(f.state.clone(), "v1".into()));
+        finishes(flush, "flush hung (lock-order deadlock)").await;
+        assert_eq!(
+            finishes(rp, "re-push hung (lock-order deadlock)").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            finishes(del, "delete hung (lock-order deadlock)").await,
+            StatusCode::ACCEPTED
+        );
+    }
+
+    /// the pull's statistics take only the metadata lock — a pull during a re-push (held at
+    /// its manifest write) must not leave the push waiting forever.
+    #[tokio::test]
+    async fn a_pull_during_a_re_push_does_not_deadlock() {
+        let f = fx(false, false).await;
+        f.held.arm(PUT, TAG_MANIFEST);
+        let rp = tokio::spawn(push(f.state.clone(), f.manifest.clone()));
+        reached(&f.held.reached, "re-push manifest write not reached").await;
+        pull(&f.state, "v1").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        f.held.release.notify_one();
+        assert_eq!(
+            finishes(rp, "re-push hung (lock-order deadlock)").await,
+            StatusCode::CREATED
+        );
+    }
+
+    /// a push writes all of its metadata while it still holds the manifest lock — a delete
+    /// that arrives mid-push runs after it, and leaves no metadata of the deleted manifest.
+    #[tokio::test]
+    async fn a_delete_during_a_push_leaves_no_metadata() {
+        let f = fx(false, false).await;
+        let dm = format!("docker/race-img/manifests/{}.json", f.digest);
+        let dmeta = format!("docker/race-img/manifests/{}.meta.json", f.digest);
+        f.held.arm(PUT, TAG_META);
+        let rp = tokio::spawn(push(f.state.clone(), f.manifest.clone()));
+        reached(&f.held.reached, "push metadata write not reached").await;
+        let del = tokio::spawn(delete(f.state.clone(), "v1".into()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        f.held.release.notify_one();
+        assert_eq!(finishes(rp, "push hung").await, StatusCode::CREATED);
+        assert_eq!(finishes(del, "delete hung").await, StatusCode::ACCEPTED);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for (m, meta) in [(TAG_MANIFEST, TAG_META), (dm.as_str(), dmeta.as_str())] {
+            if f.state.storage.stat(m).await.is_none() {
+                assert!(
+                    f.state.storage.stat(meta).await.is_none(),
+                    "metadata {meta} outlived its deleted manifest"
+                );
+            }
+        }
+    }
+}
+
+/// Only the metadata section builds a manifest metadata key: `manifest_meta_key` is called, and
+/// `.meta.json` written, in no other production function — so every write and delete of a
+/// manifest's metadata goes through the helpers that keep the order "manifest, then metadata,
+/// manifest lock before metadata lock". A white list, not a list of forbidden forms (the method's
+/// stop rule after two failed held-out rounds).
+#[cfg(test)]
+mod only_the_metadata_section_builds_metadata_keys {
+    /// The functions that may build a metadata key: its definition, the three helpers, and the
+    /// reader of a push date.
+    const ALLOWED: [&str; 7] = [
+        "manifest_meta_key",
+        "write_manifest_meta",
+        "delete_manifest_and_meta",
+        "extract_docker_publish_date",
+        // #1114: pull stats are keyed off the manifest meta key and derive the
+        // .stats.json sidecar key from it.
+        "serve_cached_manifest",
+        "manifest_stats_key",
+        "flush_pull_stats",
+    ];
+
+    /// The function a line belongs to: the last `fn name` header above it.
+    fn fn_name(line: &str) -> Option<&str> {
+        let at = line.find("fn ")?;
+        let before = &line[..at];
+        if !before.trim().is_empty()
+            && ![
+                "pub",
+                "pub(crate)",
+                "async",
+                "pub async",
+                "pub(crate) async",
+            ]
+            .contains(&before.trim())
+        {
+            return None;
+        }
+        let rest = &line[at + 3..];
+        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+        Some(&rest[..end])
+    }
+
+    /// Every line of the production part that builds a metadata key outside the white list, and
+    /// every top-level line after the first test module that is not part of a test module.
+    fn violations(src: &str) -> Vec<String> {
+        let cut = src
+            .find("\n#[cfg(test)]\n")
+            .expect("docker.rs has test modules");
+        let (production, tests) = src.split_at(cut);
+        let mut found = Vec::new();
+        let mut current: Option<&str> = None;
+        for (i, line) in production.lines().enumerate() {
+            if let Some(name) = fn_name(line) {
+                current = Some(name);
+            }
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            let builds = (line.contains("manifest_meta_key")
+                && fn_name(line) != Some("manifest_meta_key"))
+                || line.contains(".meta.json");
+            if builds && !current.is_some_and(|f| ALLOWED.contains(&f)) {
+                found.push(format!(
+                    "line {}: {} (in {:?})",
+                    i + 1,
+                    line.trim(),
+                    current
+                ));
+            }
+        }
+        // After the first test module only test modules follow.
+        let mut attrs_have_cfg_test = false;
+        for line in tests.lines() {
+            if line.is_empty()
+                || line.starts_with(' ')
+                || line.starts_with('\t')
+                || line.starts_with('}')
+            {
+                continue;
+            }
+            if line.starts_with("//") {
+                continue;
+            }
+            if line.starts_with("#[") {
+                attrs_have_cfg_test |= line.starts_with("#[cfg(test)]");
+                continue;
+            }
+            if line.starts_with("mod ") && attrs_have_cfg_test {
+                attrs_have_cfg_test = false;
+                continue;
+            }
+            found.push(format!("production item after the tests: {line}"));
+        }
+        found
+    }
+
+    #[test]
+    fn only_the_metadata_section_builds_metadata_keys() {
+        let src = include_str!("docker.rs");
+        assert_eq!(violations(src), Vec::<String>::new());
+    }
+
+    // Controls: a metadata key built in another function, or a production function after the
+    // tests, is caught; a comment that mentions `.meta.json` is not.
+    #[test]
+    fn the_white_list_catches_a_key_built_elsewhere() {
+        let src = include_str!("docker.rs");
+        let cut = src.find("\n#[cfg(test)]\n").unwrap();
+        let mut built_elsewhere = src.to_string();
+        built_elsewhere.insert_str(
+            cut,
+            "\nasync fn stray(state: &AppState) {\n    let _ = state.storage.delete(&manifest_meta_key(None, \"a\", \"b\")).await;\n}\n",
+        );
+        assert_eq!(violations(&built_elsewhere).len(), 1);
+        let mut literal = src.to_string();
+        literal.insert_str(
+            cut,
+            "\nfn stray() -> &'static str {\n    \"docker/a/manifests/b.meta.json\"\n}\n",
+        );
+        assert_eq!(violations(&literal).len(), 1);
+        let mut after_tests = src.to_string();
+        after_tests.push_str("\nasync fn late(state: &AppState) {\n    let _ = state;\n}\n");
+        assert_eq!(violations(&after_tests).len(), 1);
+        // The function itself handed to another name, too.
+        let mut alias = src.to_string();
+        alias.insert_str(
+            cut,
+            "\nfn stray() {\n    let key = manifest_meta_key;\n    let _ = key;\n}\n",
+        );
+        assert_eq!(violations(&alias).len(), 1);
+        let mut comment = src.to_string();
+        comment.insert_str(
+            cut,
+            "\nfn quiet() {\n    // the .meta.json sidecar is written elsewhere\n}\n",
+        );
+        assert_eq!(violations(&comment), Vec::<String>::new());
     }
 }

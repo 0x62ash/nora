@@ -81,7 +81,7 @@ async fn download(
             &headers,
             crate::curation::RegistryType::Raw,
             &path,
-            None,
+            crate::curation::RequestVersion::Unspecified,
             publish_date,
         ) {
             return response;
@@ -135,6 +135,9 @@ async fn download(
                     header::CACHE_CONTROL,
                     state.config.raw.cache_control.clone(),
                 )];
+                for (name, value) in download_safety_headers() {
+                    extra.push((name, value.to_string()));
+                }
                 if let Some(tag) = etag {
                     extra.push((header::ETAG, tag));
                 }
@@ -172,6 +175,9 @@ async fn download(
                 .header(header::CONTENT_LENGTH, len.to_string())
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
+            for (name, value) in download_safety_headers() {
+                builder = builder.header(name, value);
+            }
             if let Some(ref hash) = pin {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
@@ -436,8 +442,26 @@ async fn upload(
     let file_exists = state.storage.stat(&key).await.is_some();
 
     match (file_exists, if_none_match.as_deref(), if_match.as_deref()) {
-        // No conditional headers, file exists → 409 (backward compat)
+        // No conditional headers, file exists → idempotent success if the
+        // uploaded bytes match what's stored (#1036: object-storage clients
+        // retry uploads after a partial transfer, and a retry of identical
+        // bytes must not be a hard failure); 409 otherwise (backward compat,
+        // immutability preserved for genuinely different content).
         (true, None, None) => {
+            if let Some(hash) = state.storage.pin(&key).await {
+                if hash == sha256 {
+                    return do_overwrite(
+                        &state,
+                        &key,
+                        &path,
+                        &temp_path,
+                        &sha256,
+                        &mut temp_guard,
+                        crate::auth::audit_actor(&user),
+                    )
+                    .await;
+                }
+            }
             return (
                 StatusCode::CONFLICT,
                 format!("File already exists: {}", path),
@@ -520,6 +544,13 @@ async fn upload(
     }
 
     // Create new file — commit the streamed temp (rename on the local backend).
+    //
+    // Answers 200, not 201 (#1039): `raw` is the surface object-storage clients reach
+    // for, and they read anything but 200 as a failure. Lake 5.0.0 aborts an upload with
+    // `error: failed to upload artifact, error 201` while the object is in fact stored —
+    // the worst shape of a failure. S3's own PutObject answers 200, so one success code
+    // for every raw PUT (create, If-Match overwrite, re-PUT of identical bytes) is both
+    // what such a client expects and simpler to document.
     match state
         .storage
         .put_from_path(&key, &temp_path, Some(&sha256))
@@ -542,13 +573,29 @@ async fn upload(
                 "LOCAL",
             ));
             state.repo_index.invalidate("raw");
-            StatusCode::CREATED.into_response()
+            StatusCode::OK.into_response()
         }
         Err(e) => {
+            if name_taken(&e) {
+                return (
+                    StatusCode::CONFLICT,
+                    format!("Other files already use the name {path}"),
+                )
+                    .into_response();
+            }
             tracing::error!(error = %e, key = %key, "Failed to store raw artifact");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Whether a raw write failed because the local store already uses the name the other way
+/// round — a directory at the key, or a file at a parent name: that is a taken name (409),
+/// any other failure stays 500. Only the local backend reports it; an object store holds
+/// both names.
+fn name_taken(err: &crate::storage::StorageError) -> bool {
+    matches!(err, crate::storage::StorageError::Io(e)
+        if e.get_ref().is_some_and(|inner| inner.is::<crate::storage::NameTaken>()))
 }
 
 /// Overwrite an existing file (conditional PUT with `If-Match`).
@@ -660,10 +707,29 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
     }
 }
 
+/// Where streamed raw uploads are written before commit, under the storage path.
+const RAW_UPLOAD_TEMP_SUBDIR: &str = "tmp/raw-uploads";
+
+/// Idle age after which a streamed raw upload's temp file is an orphan: the same
+/// bound as Docker proxy temp files (#580).
+const RAW_UPLOAD_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
+
+/// Remove streamed raw upload temp files orphaned by a crash mid-upload (SIGKILL,
+/// OOM) or a failed commit — nothing else ever removes them. Called at startup and
+/// every 5 minutes; an upload in progress keeps writing its file, so it is never
+/// this old.
+pub fn cleanup_upload_temp_dir(data_dir: &str) {
+    let dir = std::path::PathBuf::from(data_dir).join(RAW_UPLOAD_TEMP_SUBDIR);
+    let removed = super::remove_stale_temp_files(&dir, RAW_UPLOAD_TEMP_MAX_AGE);
+    if removed > 0 {
+        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale raw upload temp files");
+    }
+}
+
 /// Temp directory for streamed raw uploads, created on demand. Lives inside
 /// the storage path so the local backend's commit is a same-filesystem rename.
 fn raw_upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(data_dir).join("tmp/raw-uploads");
+    let dir = std::path::PathBuf::from(data_dir).join(RAW_UPLOAD_TEMP_SUBDIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::error!(path = %dir.display(), error = %e, "failed to create raw upload temp directory");
     }
@@ -678,6 +744,25 @@ fn format_http_date(timestamp: u64) -> String {
         Some(dt) => dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
         None => String::new(),
     }
+}
+
+/// Headers that make a raw download safe to serve: the browser saves the file
+/// instead of rendering it, and even a forced render runs nothing.
+///
+/// Raw stores arbitrary user-uploaded bytes, and `guess_content_type` labels
+/// `.html`/`.svg`/`.js` with their active types. Without these a stored file
+/// would execute as a page at NORA's own origin, with the viewer's session.
+/// `Content-Disposition: attachment` makes the browser download rather than
+/// render it (RFC 6266; no filename, so there is no header-injection surface —
+/// the browser names it from the URL). `Content-Security-Policy: sandbox` with
+/// no tokens is the strongest fallback for anything a client renders anyway:
+/// no scripts, no forms, no same-origin. Both paths (full and ranged) carry
+/// them, so they cannot drift apart.
+fn download_safety_headers() -> [(header::HeaderName, &'static str); 2] {
+    [
+        (header::CONTENT_DISPOSITION, "attachment"),
+        (header::CONTENT_SECURITY_POLICY, "sandbox"),
+    ]
 }
 
 fn guess_content_type(path: &str) -> &'static str {
@@ -709,6 +794,34 @@ fn guess_content_type(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A streamed upload orphaned by a crash is reaped once idle past the bound; a
+    /// file still being written is kept (#1055 polygon: SIGKILL mid-PUT left them
+    /// forever).
+    #[test]
+    fn test_cleanup_upload_temp_dir_reaps_only_idle_files() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().to_str().unwrap();
+        let dir = raw_upload_temp_dir(root);
+        let orphan = dir.join("orphan");
+        let live = dir.join("live");
+        std::fs::write(&orphan, b"partial").unwrap();
+        std::fs::write(&live, b"partial").unwrap();
+        let idle = std::time::SystemTime::now()
+            - RAW_UPLOAD_TEMP_MAX_AGE
+            - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(idle))
+            .unwrap();
+
+        cleanup_upload_temp_dir(root);
+
+        assert!(!orphan.exists(), "an idle orphan must be reaped");
+        assert!(live.exists(), "a file still being written must be kept");
+    }
 
     #[test]
     fn test_guess_content_type_json() {
@@ -847,7 +960,7 @@ mod integration_tests {
             Body::from(&b"x"[..]),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.status(), StatusCode::OK);
 
         // DELETE out of scope -> 403.
         let resp = super::delete_file(
@@ -869,19 +982,70 @@ mod integration_tests {
             Body::from(&b"x"[..]),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_raw_put_get_roundtrip() {
         let ctx = create_test_context();
         let put_resp = send(&ctx.app, Method::PUT, "/raw/test.txt", b"hello".to_vec()).await;
-        assert_eq!(put_resp.status(), StatusCode::CREATED);
+        assert_eq!(put_resp.status(), StatusCode::OK);
 
         let get_resp = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
         assert_eq!(get_resp.status(), StatusCode::OK);
         let body = body_bytes(get_resp).await;
         assert_eq!(&body[..], b"hello");
+    }
+
+    // Raw holds arbitrary user bytes, and a file named `.html`/`.svg` is served with an active
+    // content-type. Every raw download — full, ranged, and whatever the extension — must carry
+    // `Content-Disposition: attachment` (the browser saves it, does not render it) and
+    // `Content-Security-Policy: sandbox` (a forced render runs nothing).
+    #[tokio::test]
+    async fn test_raw_download_is_served_as_an_inert_attachment() {
+        use crate::test_helpers::send_with_headers;
+        let ctx = create_test_context();
+        for (name, body) in [
+            ("page.html", b"<script>alert(1)</script>".to_vec()),
+            (
+                "drawing.svg",
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec(),
+            ),
+            ("app.js", b"globalThis.x = 1".to_vec()),
+            ("notes.txt", b"plain".to_vec()),
+        ] {
+            let path = format!("/raw/xss/{name}");
+            assert_eq!(
+                send(&ctx.app, Method::PUT, &path, body).await.status(),
+                StatusCode::OK
+            );
+            for (label, resp) in [
+                ("full", send(&ctx.app, Method::GET, &path, "").await),
+                (
+                    "ranged",
+                    send_with_headers(
+                        &ctx.app,
+                        Method::GET,
+                        &path,
+                        vec![("range", "bytes=0-1")],
+                        "",
+                    )
+                    .await,
+                ),
+            ] {
+                let h = resp.headers();
+                assert_eq!(
+                    h.get("content-disposition").map(|v| v.as_bytes()),
+                    Some(b"attachment".as_ref()),
+                    "{name} {label}: not an attachment"
+                );
+                assert_eq!(
+                    h.get("content-security-policy").map(|v| v.as_bytes()),
+                    Some(b"sandbox".as_ref()),
+                    "{name} {label}: not sandboxed"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -923,7 +1087,7 @@ mod integration_tests {
         // ~3.2MB of non-repeating bytes — crosses many body frames.
         let body: Vec<u8> = (0..800_000u32).flat_map(|i| i.to_le_bytes()).collect();
         let put = send(&ctx.app, Method::PUT, "/raw/big.bin", body.clone()).await;
-        assert_eq!(put.status(), StatusCode::CREATED);
+        assert_eq!(put.status(), StatusCode::OK);
 
         let get = send(&ctx.app, Method::GET, "/raw/big.bin", "").await;
         assert_eq!(get.status(), StatusCode::OK);
@@ -964,7 +1128,7 @@ mod integration_tests {
         let ctx = create_test_context();
         let body = vec![7u8; 300_000];
         let put = send(&ctx.app, Method::PUT, "/raw/pinned.bin", body.clone()).await;
-        assert_eq!(put.status(), StatusCode::CREATED);
+        assert_eq!(put.status(), StatusCode::OK);
 
         // Corrupt the object behind the pin store's back.
         let on_disk = std::path::Path::new(&ctx.state.config.storage.path).join("raw/pinned.bin");
@@ -1022,7 +1186,7 @@ mod integration_tests {
             b"first".to_vec(),
         )
         .await;
-        assert_eq!(put1.status(), StatusCode::CREATED);
+        assert_eq!(put1.status(), StatusCode::OK);
 
         let put2 = send(
             &ctx.app,
@@ -1038,6 +1202,39 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::OK);
         let body = body_bytes(get).await;
         assert_eq!(&body[..], b"first");
+    }
+
+    /// #1036: a re-PUT of the exact same bytes, with no conditional headers,
+    /// must succeed instead of 409 — object-storage clients retry uploads
+    /// after a partial transfer and treat a retry of identical content as
+    /// routine, not a conflict. Different bytes under the same key must
+    /// still be rejected (test_raw_immutable_overwrite_rejected above).
+    #[tokio::test]
+    async fn test_raw_reput_identical_bytes_is_idempotent() {
+        let ctx = create_test_context();
+        let put1 = send(
+            &ctx.app,
+            Method::PUT,
+            "/raw/idempotent.txt",
+            b"same bytes".to_vec(),
+        )
+        .await;
+        assert_eq!(put1.status(), StatusCode::OK);
+
+        let put2 = send(
+            &ctx.app,
+            Method::PUT,
+            "/raw/idempotent.txt",
+            b"same bytes".to_vec(),
+        )
+        .await;
+        assert_eq!(put2.status(), StatusCode::OK);
+
+        // Content is unchanged and still readable.
+        let get = send(&ctx.app, Method::GET, "/raw/idempotent.txt", "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = body_bytes(get).await;
+        assert_eq!(&body[..], b"same bytes");
     }
 
     #[tokio::test]
@@ -1102,7 +1299,7 @@ mod integration_tests {
 
         // Upload a file first (upload is not curated)
         let put = send(&ctx.app, Method::PUT, "/raw/secret.txt", b"data".to_vec()).await;
-        assert_eq!(put.status(), StatusCode::CREATED);
+        assert_eq!(put.status(), StatusCode::OK);
 
         // Download should be blocked by curation
         let get = send(&ctx.app, Method::GET, "/raw/secret.txt", "").await;
@@ -1110,7 +1307,7 @@ mod integration_tests {
 
         // Non-matching file should pass
         let put2 = send(&ctx.app, Method::PUT, "/raw/public.txt", b"ok".to_vec()).await;
-        assert_eq!(put2.status(), StatusCode::CREATED);
+        assert_eq!(put2.status(), StatusCode::OK);
         let get2 = send(&ctx.app, Method::GET, "/raw/public.txt", "").await;
         assert_eq!(get2.status(), StatusCode::OK);
     }
@@ -1174,7 +1371,7 @@ mod integration_tests {
             b"content".to_vec(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1272,7 +1469,7 @@ mod integration_tests {
     async fn test_raw_put_no_headers_still_409() {
         let ctx = create_test_context();
         let put1 = send(&ctx.app, Method::PUT, "/raw/compat.txt", b"v1".to_vec()).await;
-        assert_eq!(put1.status(), StatusCode::CREATED);
+        assert_eq!(put1.status(), StatusCode::OK);
 
         let put2 = send(&ctx.app, Method::PUT, "/raw/compat.txt", b"v2".to_vec()).await;
         assert_eq!(put2.status(), StatusCode::CONFLICT);
@@ -1466,6 +1663,230 @@ mod integration_tests {
         assert_eq!(&body_bytes(fresh).await[..], b"2345");
     }
 
+    /// With `dir/f.txt` stored, `/raw/dir` names no file: HEAD, GET, a ranged GET and DELETE
+    /// answer as for a path never stored, on the local store as on an object store. On the
+    /// local store `raw/dir` is a directory, which was answered 200 with the directory's size
+    /// and a body that broke off.
+    #[tokio::test]
+    async fn a_path_that_is_only_a_directory_is_answered_as_missing() {
+        use crate::storage::ObjectStorage;
+
+        let local = create_test_context();
+        let object = crate::test_helpers::create_test_context_with_storage(Storage::from_backend(
+            std::sync::Arc::new(ObjectStorage::in_memory()),
+        ));
+        for (backend, ctx) in [("local", &local), ("object", &object)] {
+            for (uri, body) in [("/raw/dir/f.txt", "hello"), ("/raw/file.txt", "x")] {
+                let put = send(&ctx.app, Method::PUT, uri, body.as_bytes().to_vec()).await;
+                assert_eq!(put.status(), StatusCode::OK, "{backend} {uri}");
+            }
+            for uri in ["/raw/dir", "/raw/file.txt/x"] {
+                for method in [Method::HEAD, Method::GET, Method::DELETE] {
+                    let named = send(&ctx.app, method.clone(), uri, "").await;
+                    let none = send(&ctx.app, method.clone(), "/raw/none", "").await;
+                    assert_eq!(named.status(), none.status(), "{backend} {method} {uri}");
+                }
+            }
+            let ranged = |uri: &'static str| {
+                send_with_headers(&ctx.app, Method::GET, uri, vec![("range", "bytes=0-9")], "")
+            };
+            assert_eq!(
+                ranged("/raw/dir").await.status(),
+                ranged("/raw/none").await.status(),
+                "{backend} ranged GET"
+            );
+            let get = send(&ctx.app, Method::GET, "/raw/dir/f.txt", "").await;
+            assert_eq!(&body_bytes(get).await[..], b"hello", "{backend}");
+        }
+        // Only an object store can hold a file named like a directory of other files; the
+        // local store refuses it as a taken name, never as a server fault.
+        for uri in ["/raw/dir", "/raw/dir/f.txt/x", "/raw/dir/f.txt/sub/x"] {
+            let put = send(&local.app, Method::PUT, uri, b"x".to_vec()).await;
+            assert_eq!(put.status(), StatusCode::CONFLICT, "local PUT {uri}");
+            let put = send(&object.app, Method::PUT, uri, b"x".to_vec()).await;
+            assert_eq!(put.status(), StatusCode::OK, "object PUT {uri}");
+        }
+        // Deleting a directory's last file leaves the directory on a local store: the name
+        // stays taken there (409, plain or `If-None-Match: *`), and is free on an object store.
+        for (backend, ctx, want) in [
+            ("local", &local, StatusCode::CONFLICT),
+            ("object", &object, StatusCode::OK),
+        ] {
+            for (n, headers) in [("e1", vec![]), ("e2", vec![("if-none-match", "*")])] {
+                let inner = format!("/raw/{n}/f.txt");
+                let put = send(&ctx.app, Method::PUT, &inner, b"x".to_vec()).await;
+                assert_eq!(put.status(), StatusCode::OK, "{backend} {inner}");
+                let del = send(&ctx.app, Method::DELETE, &inner, "").await;
+                assert_eq!(del.status(), StatusCode::NO_CONTENT, "{backend} {inner}");
+                let uri = format!("/raw/{n}");
+                for method in [Method::HEAD, Method::GET] {
+                    let emptied = send(&ctx.app, method.clone(), &uri, "").await;
+                    let none = send(&ctx.app, method.clone(), "/raw/none", "").await;
+                    assert_eq!(emptied.status(), none.status(), "{backend} {method} {uri}");
+                }
+                let put =
+                    send_with_headers(&ctx.app, Method::PUT, &uri, headers, b"x".to_vec()).await;
+                assert_eq!(put.status(), want, "{backend} PUT {uri}");
+            }
+        }
+    }
+
+    /// Makes a directory read-only for a test and gives it back on drop. `None` when this
+    /// user can still write into it (root, CAP_DAC_OVERRIDE): the failure the test needs
+    /// cannot be made here, and the test says so instead of passing on a write that worked.
+    struct ReadOnly(std::path::PathBuf);
+
+    impl ReadOnly {
+        fn new(dir: std::path::PathBuf) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let guard = Self(dir);
+            let probe = guard.0.join(".write-probe");
+            if std::fs::write(&probe, b"").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                eprintln!("skipped: this user writes into a read-only directory");
+                return None;
+            }
+            Some(guard)
+        }
+    }
+
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Only a taken name is 409: a raw write that fails for any other reason (here the
+    /// directory refuses writes) stays a server fault.
+    #[tokio::test]
+    async fn a_write_that_fails_for_another_reason_stays_500() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/ro/a.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let Some(_ro) = ReadOnly::new(ctx._tempdir.path().join("raw/ro")) else {
+            return;
+        };
+        let put = send(&ctx.app, Method::PUT, "/raw/ro/b.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A delete that fails on a stored file is a fault, not "not found" while the file is
+    /// still there and still served.
+    #[tokio::test]
+    async fn a_delete_that_fails_on_a_stored_file_stays_a_fault() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/ro/a.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let Some(ro) = ReadOnly::new(ctx._tempdir.path().join("raw/ro")) else {
+            return;
+        };
+        let del = send(&ctx.app, Method::DELETE, "/raw/ro/a.txt", "").await;
+        drop(ro);
+        let get = send(&ctx.app, Method::GET, "/raw/ro/a.txt", "").await;
+        assert_eq!(get.status(), StatusCode::OK, "the file is still there");
+        assert_eq!(del.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// a key whose path is a directory is a missing key on delete even when
+    /// unlink(2) refuses it with an errno other than EISDIR (EACCES under a read-only
+    /// parent on Linux; EPERM for any directory on macOS).
+    #[tokio::test]
+    async fn deleting_a_directory_under_a_read_only_parent_is_not_found() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/ro/sub/f.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let Some(ro) = ReadOnly::new(ctx._tempdir.path().join("raw/ro")) else {
+            return;
+        };
+        let dir = send(&ctx.app, Method::DELETE, "/raw/ro/sub", "").await;
+        let none = send(&ctx.app, Method::DELETE, "/raw/ro/none", "").await;
+        drop(ro);
+        assert_eq!(none.status(), StatusCode::NOT_FOUND);
+        assert_eq!(dir.status(), none.status(), "DELETE of a directory key");
+    }
+
+    /// a file at any parent name takes the name, however deep the key below it.
+    #[tokio::test]
+    async fn a_file_any_level_up_takes_the_name() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/d/f.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let put = send(&ctx.app, Method::PUT, "/raw/d/f.txt/a/b/x", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::CONFLICT);
+    }
+
+    /// on an object store a name is never taken, so a write that fails for
+    /// another reason stays 500 even when an object sits at a parent name.
+    #[tokio::test]
+    async fn an_object_store_write_failure_stays_500_under_a_stored_name() {
+        use crate::storage::{FileMeta, ObjectStorage, Result as SResult, StorageBackend};
+        use axum::body::Bytes;
+        use std::path::Path;
+        use std::pin::Pin;
+        use tokio::io::AsyncRead;
+
+        struct FailsUnder(ObjectStorage);
+        #[async_trait::async_trait]
+        impl StorageBackend for FailsUnder {
+            async fn put(&self, k: &str, d: &[u8], s: &str) -> SResult<()> {
+                self.0.put(k, d, s).await
+            }
+            async fn get(&self, k: &str) -> SResult<(Bytes, Option<String>)> {
+                self.0.get(k).await
+            }
+            async fn pin(&self, k: &str) -> Option<String> {
+                self.0.pin(k).await
+            }
+            async fn delete(&self, k: &str) -> SResult<()> {
+                self.0.delete(k).await
+            }
+            async fn list(&self, p: &str) -> SResult<Vec<String>> {
+                self.0.list(p).await
+            }
+            async fn stat(&self, k: &str) -> Option<FileMeta> {
+                self.0.stat(k).await
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn total_size(&self) -> u64 {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "s3"
+            }
+            async fn put_from_path(&self, k: &str, src: &Path, s: Option<&str>) -> SResult<()> {
+                if k.ends_with("/x") {
+                    return Err(StorageError::Io(std::io::Error::other("upstream 503")));
+                }
+                self.0.put_from_path(k, src, s).await
+            }
+            async fn copy(&self, a: &str, b: &str, s: Option<&str>) -> SResult<()> {
+                self.0.copy(a, b, s).await
+            }
+            async fn get_reader(
+                &self,
+                k: &str,
+            ) -> SResult<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>
+            {
+                self.0.get_reader(k).await
+            }
+        }
+        let ctx = crate::test_helpers::create_test_context_with_storage(Storage::from_backend(
+            std::sync::Arc::new(FailsUnder(ObjectStorage::in_memory())),
+        ));
+        let put = send(&ctx.app, Method::PUT, "/raw/f.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let put = send(&ctx.app, Method::PUT, "/raw/f.txt/x", b"x".to_vec()).await;
+        assert_eq!(
+            put.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "object store fault"
+        );
+    }
+
     /// The ETag flows are backend-agnostic since the pin became object
     /// metadata: HEAD advertises it, a matching `If-None-Match` is a 304, and a
     /// conditional overwrite matches on it — all on an object store.
@@ -1479,7 +1900,7 @@ mod integration_tests {
         ));
 
         let put = send(&ctx.app, Method::PUT, "/raw/obj.txt", b"v1".to_vec()).await;
-        assert_eq!(put.status(), StatusCode::CREATED);
+        assert_eq!(put.status(), StatusCode::OK);
 
         let head = send(&ctx.app, Method::HEAD, "/raw/obj.txt", "").await;
         assert_eq!(head.status(), StatusCode::OK);
@@ -1553,7 +1974,7 @@ mod integration_tests {
             b"hello".to_vec(),
         )
         .await;
-        assert_eq!(ok.status(), StatusCode::CREATED);
+        assert_eq!(ok.status(), StatusCode::OK);
 
         // Mismatch is rejected before anything is stored.
         let bad = send_with_headers(
@@ -1598,7 +2019,7 @@ mod integration_tests {
             b"hello".to_vec(),
         )
         .await;
-        assert_eq!(multi.status(), StatusCode::CREATED);
+        assert_eq!(multi.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1615,5 +2036,155 @@ mod integration_tests {
             .to_str()
             .unwrap();
         assert_eq!(cc, "no-cache");
+    }
+
+    // ── A name with an empty segment never names another key's file ─────────
+
+    /// `GET /raw//secret.txt` names the file of `raw/secret.txt` under the name `/secret.txt`,
+    /// which the rule `secret*` does not cover — refused before curation and storage.
+    #[tokio::test]
+    async fn a_read_under_an_empty_segment_is_refused_before_curation() {
+        use crate::config::CurationMode;
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "raw", "name": "secret*", "version": "*", "reason": "blocked"}]}"#,
+        )
+        .unwrap();
+        let bp = blocklist.to_str().unwrap().to_string();
+        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bp);
+        });
+        let put = send(&ctx.app, Method::PUT, "/raw/secret.txt", b"data".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let canonical = send(&ctx.app, Method::GET, "/raw/secret.txt", "").await;
+        assert_eq!(canonical.status(), StatusCode::FORBIDDEN, "control");
+
+        let mut served = Vec::new();
+        for alias in ["/raw//secret.txt", "/raw/%2Fsecret.txt"] {
+            let resp = send(&ctx.app, Method::GET, alias, "").await;
+            if resp.status() == StatusCode::OK {
+                served.push(format!("{alias} -> {:?}", body_bytes(resp).await));
+            }
+        }
+        assert!(served.is_empty(), "blocklisted file served: {served:?}");
+    }
+
+    /// A read at `raw//...` is refused: pins are kept by the key string, so it would find no
+    /// pin and stream tampered bytes the canonical read refuses (the control).
+    #[tokio::test]
+    async fn a_read_under_an_empty_segment_never_skips_the_pin() {
+        let ctx = create_test_context();
+        let body = vec![7u8; 300_000];
+        let put = send(&ctx.app, Method::PUT, "/raw/dir/pinned.bin", body.clone()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let on_disk =
+            std::path::Path::new(&ctx.state.config.storage.path).join("raw/dir/pinned.bin");
+        let mut tampered = std::fs::read(&on_disk).unwrap();
+        tampered[150_000] ^= 0xFF;
+        std::fs::write(&on_disk, &tampered).unwrap();
+
+        let canonical = send(&ctx.app, Method::GET, "/raw/dir/pinned.bin", "").await;
+        let canonical = axum::body::to_bytes(canonical.into_body(), usize::MAX).await;
+        assert!(
+            canonical.map(|b| b.len() < body.len()).unwrap_or(true),
+            "control: the canonical read must not arrive complete"
+        );
+
+        let alias = send(&ctx.app, Method::GET, "/raw/dir//pinned.bin", "").await;
+        let alias = axum::body::to_bytes(alias.into_body(), usize::MAX).await;
+        assert!(
+            alias.map(|b| b != tampered).unwrap_or(true),
+            "the alias read served the tampered bytes in full"
+        );
+    }
+
+    /// An `If-Match: *` write to `raw/dir//f.bin` is refused: it would replace the canonical
+    /// file's bytes and pin them under another string, so the canonical read would abort.
+    #[tokio::test]
+    async fn a_write_under_an_empty_segment_never_breaks_the_canonical_read() {
+        let ctx = create_test_context();
+        let v1 = vec![1u8; 300_000];
+        let v2 = vec![2u8; 300_000];
+        let put = send(&ctx.app, Method::PUT, "/raw/dir/f.bin", v1.clone()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let _ = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/dir//f.bin",
+            vec![("if-match", "*")],
+            v2.clone(),
+        )
+        .await;
+
+        let resp = send(&ctx.app, Method::GET, "/raw/dir/f.bin", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        assert!(
+            matches!(&got, Ok(b) if b[..] == v1[..] || b[..] == v2[..]),
+            "canonical object no longer servable after a PUT to its alias ({} bytes)",
+            got.as_ref().map(|b| b.len()).unwrap_or(0)
+        );
+    }
+
+    /// A create-only write under `raw/dir//f.bin` never replaces the existing `raw/dir/f.bin`.
+    #[tokio::test]
+    async fn a_create_only_write_under_an_empty_segment_never_overwrites() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/dir/g.bin", b"v1".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let alias = send(&ctx.app, Method::PUT, "/raw/dir//g.bin", b"v2".to_vec()).await;
+        assert!(!alias.status().is_success(), "{}", alias.status());
+        let get = send(&ctx.app, Method::GET, "/raw/dir/g.bin", "").await;
+        assert_eq!(&body_bytes(get).await[..], b"v1");
+    }
+
+    /// A `*` segment of a token scope never matches an empty segment: `PUT /raw//releases/x.bin`
+    /// does not pass the scope `*/releases/**` and land on `raw/releases/x.bin`, whose own
+    /// coordinate `releases/x.bin` is outside that scope.
+    #[tokio::test]
+    async fn a_scope_star_never_grants_a_write_through_an_empty_segment() {
+        use crate::config::ScopeEnforcement;
+        use axum::body::Body;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let ctx = create_test_context();
+        let scope = || {
+            crate::auth::NamespaceAuthority::from_oidc_scope(
+                "ci",
+                &["*/releases/**".to_string()],
+                ScopeEnforcement::Enforce,
+            )
+        };
+        // Control: the canonical coordinate is out of scope.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("releases/x.bin".to_string()),
+            Extension(scope()),
+            None,
+            axum::http::HeaderMap::new(),
+            Body::from(&b"x"[..]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("/releases/x.bin".to_string()),
+            Extension(scope()),
+            None,
+            axum::http::HeaderMap::new(),
+            Body::from(&b"x"[..]),
+        )
+        .await;
+        assert!(
+            !resp.status().is_success(),
+            "out-of-scope write accepted via the alias: {}",
+            resp.status()
+        );
+        assert!(ctx.state.storage.get("raw/releases/x.bin").await.is_err());
     }
 }

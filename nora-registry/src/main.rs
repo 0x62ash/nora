@@ -19,6 +19,16 @@
         clippy::items_after_test_module
     )
 )]
+
+// musl's mallocng serializes every allocation on one global lock, which collapses into kernel
+// futex contention under many async workers; mimalloc's per-thread heaps avoid it. Feature
+// `mimalloc` is on by default; `--no-default-features` falls back to the system allocator.
+// Declaring the static needs no unsafe here (the GlobalAlloc impl lives in the crate), so
+// `#![forbid(unsafe_code)]` still holds.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod activity_log;
 mod admin;
 mod audit;
@@ -36,6 +46,7 @@ mod gc;
 mod hash_pin_store;
 mod health;
 mod import;
+mod log_redact;
 mod metrics;
 mod migrate;
 mod mirror;
@@ -55,11 +66,14 @@ mod ui;
 mod validation;
 
 #[cfg(test)]
+mod test_env;
+#[cfg(test)]
 mod test_helpers;
 
 use arc_swap::ArcSwap;
 use axum::{body::Bytes, extract::DefaultBodyLimit, http::HeaderValue, middleware, Router};
 use clap::{Parser, Subcommand};
+use log_redact::RedactUserinfo;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -268,6 +282,11 @@ pub struct AppState {
     /// Shared shutdown signal so on-demand background tasks (e.g. the admin
     /// reindex warm-up) stop promptly on SIGTERM/SIGINT (#306).
     pub cancel_token: tokio_util::sync::CancellationToken,
+    /// Off-request-path docker pull-stats accumulator (#1114): a manifest GET
+    /// bumps the per-key counter here; a background task flushes it in batches
+    /// to a `.stats.json` sidecar, so `.meta.json` is never rewritten by a pull.
+    /// In-memory, rebuildable-empty after a restart.
+    pub(crate) pull_stats: Arc<registry::docker::PullStatsAccumulator>,
 }
 
 impl AppState {
@@ -474,6 +493,144 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
         Err(e) => {
             eprintln!("healthcheck: {url} -> {e}");
             1
+        }
+    }
+}
+
+/// The request layers inside metrics, shared by the server and the test router so the
+/// tests run the order the server runs (#542). Innermost first: curation_refusal (audit)
+/// → request_id → leak_detection → rewrite_ui_base_path → auth. auth runs first of these;
+/// the audit layer sits inside it so it knows who was refused, and request_id runs before
+/// the handler so the ID is available to it.
+/// Response security headers applied to every route, outermost. `nosniff`,
+/// `DENY` framing and the referrer policy are uniform and override whatever a
+/// handler set. The Content-Security-Policy is added only when a handler set
+/// none (`if_not_present`): the UI's permissive policy (it needs `unsafe-inline`)
+/// is the default, but the raw download handler sets its own `sandbox` policy on
+/// user-uploaded bytes and that stricter one must survive. Kept in one function
+/// so the server and its test run the same layering.
+pub(crate) fn apply_security_headers<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    use tower_http::set_header::SetResponseHeaderLayer;
+    router
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'"),
+        ))
+}
+
+pub(crate) fn request_layers(router: Router<AppState>, state: &AppState) -> Router<AppState> {
+    router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit::curation_refusal_middleware,
+        ))
+        .layer(middleware::from_fn(request_id::request_id_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics::leak_detection_middleware,
+        ))
+        // Prefix the UI's root-absolute self-links + redirects with the public_url
+        // path so the UI works under a sub-path behind a proxy. No-op when unset;
+        // only buffers text/html (UI pages), so blob streams pass through untouched.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ui::rewrite_ui_base_path,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ))
+}
+
+#[cfg(test)]
+mod middleware_stack_tests {
+    /// The server applies the audit layer once — in `request_layers`, which the test router
+    /// shares, so router tests see where the server runs it. A second copy (say outside
+    /// auth) would record each refusal twice, once as `anonymous`; a missing or commented-out
+    /// layer is caught by the audit tests themselves. Comments are skipped, and the needle is
+    /// built at run time so this test's own text does not count.
+    #[test]
+    fn the_audit_layer_is_applied_once() {
+        let code: String = include_str!("main.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = ["curation_refusal", "_middleware"].concat();
+        assert!(
+            code.matches(&needle).count() <= 1,
+            "{needle} applied more than once"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_header_tests {
+    use super::apply_security_headers;
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    async fn header_of(app: &Router, path: &str, name: &str) -> Option<String> {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    // A handler that sets its own CSP (the raw download handler, `sandbox`) keeps it; a handler
+    // that sets none gets the permissive UI default. The default must not override a stricter
+    // handler policy, or raw's user-uploaded bytes would run under the UI's `unsafe-inline`.
+    #[tokio::test]
+    async fn a_handler_csp_survives_the_default() {
+        let app = apply_security_headers(
+            Router::<()>::new()
+                .route(
+                    "/raw-like",
+                    get(|| async { ([(header::CONTENT_SECURITY_POLICY, "sandbox")], "bytes") }),
+                )
+                .route("/ui-like", get(|| async { "page" })),
+        );
+        assert_eq!(
+            header_of(&app, "/raw-like", "content-security-policy").await,
+            Some("sandbox".to_string())
+        );
+        let default = header_of(&app, "/ui-like", "content-security-policy")
+            .await
+            .expect("a route without its own CSP gets the default");
+        assert!(
+            default.contains("script-src 'self' 'unsafe-inline'"),
+            "default UI CSP expected, got {default}"
+        );
+        // nosniff is uniform and overrides, on both.
+        for path in ["/raw-like", "/ui-like"] {
+            assert_eq!(
+                header_of(&app, path, "x-content-type-options").await,
+                Some("nosniff".to_string())
+            );
         }
     }
 }
@@ -786,7 +943,7 @@ async fn main() {
                 &cli_publish_locks,
                 dry_run,
                 config.gc.grace_secs,
-                config.npm.proxy.is_some(),
+                !config.npm.upstream_urls().is_empty(),
                 config.gc.proxy_cache_max_bytes,
             )
             .await;
@@ -795,6 +952,9 @@ async fn main() {
             println!("  Orphaned:          {}", result.orphaned);
             println!("  Deleted:           {}", result.deleted);
             println!("  Bytes freed:       {}", result.bytes_freed);
+            if result.docker_mark_failed {
+                println!("  Docker sweep:      skipped (manifest graph incomplete; all Docker objects kept)");
+            }
             if result.skipped_recent > 0 {
                 println!(
                     "  Skipped (grace):   {} (younger than {}s — likely in-flight uploads)",
@@ -831,6 +991,9 @@ async fn main() {
                     .map(|(name, count)| format!("{} ({} files)", name, count))
                     .collect();
                 println!("\nNote: GC does not scan: {}", parts.join(", "));
+            }
+            if result.docker_mark_failed {
+                std::process::exit(1);
             }
         }
         Some(Commands::RetentionPlan) => {
@@ -1275,24 +1438,59 @@ fn run_curation_validate(file: &Path) {
     std::process::exit(1);
 }
 
+/// The parts of a `registry:name@version` curation-explain spec.
+#[derive(Debug, PartialEq)]
+enum ExplainSpec {
+    Parsed {
+        registry: RegistryType,
+        name: String,
+        version: Option<String>,
+    },
+    NoColon,
+    UnknownRegistry(String),
+}
+
+/// Parse a `registry:name@version` spec (the command a refusal's hint names) back
+/// into its parts. The version follows the LAST `@`, except: an `@` that starts
+/// the name opens an npm scope (`npm:@scope/pkg`), and a `raw` name carries no
+/// version — its path may itself contain `@` (`raw:dir/a@b.txt`), so the whole
+/// remainder is the name. Pure, so a table test pins every registry's convention
+/// and the round-trip of the hint `explain_command` builds (#1099).
+fn parse_explain_spec(spec: &str) -> ExplainSpec {
+    let Some((registry_str, rest)) = spec.split_once(':') else {
+        return ExplainSpec::NoColon;
+    };
+    let Some(registry) = RegistryType::from_str_opt(registry_str) else {
+        return ExplainSpec::UnknownRegistry(registry_str.to_string());
+    };
+    let (name, version) = if registry == RegistryType::Raw {
+        // A raw name is a path and carries no version; it may itself contain '@'.
+        (rest.to_string(), None)
+    } else {
+        match rest.rfind('@') {
+            Some(at) if at > 0 => (rest[..at].to_string(), Some(rest[at + 1..].to_string())),
+            _ => (rest.to_string(), None),
+        }
+    };
+    ExplainSpec::Parsed {
+        registry,
+        name,
+        version,
+    }
+}
+
 fn run_curation_explain(config: &Config, package_spec: &str) {
-    // Parse "registry:name@version"
-    let (registry_str, rest) = match package_spec.split_once(':') {
-        Some(parts) => parts,
-        None => {
+    let (registry, name, version) = match parse_explain_spec(package_spec) {
+        ExplainSpec::Parsed {
+            registry,
+            name,
+            version,
+        } => (registry, name, version),
+        ExplainSpec::NoColon => {
             eprintln!("ERROR: Expected format 'registry:name@version' (e.g., 'cargo:serde@1.0.0')");
             std::process::exit(1);
         }
-    };
-
-    let (name, version) = match rest.split_once('@') {
-        Some((n, v)) => (n.to_string(), Some(v.to_string())),
-        None => (rest.to_string(), None),
-    };
-
-    let registry = match RegistryType::from_str_opt(registry_str) {
-        Some(rt) => rt,
-        None => {
+        ExplainSpec::UnknownRegistry(registry_str) => {
             eprintln!(
                 "ERROR: Unknown registry '{}'. Use: {}",
                 registry_str,
@@ -1362,7 +1560,7 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         registry,
         upstream: None,
         name: name.clone(),
-        version: version.clone(),
+        version: curation::RequestVersion::named(version.as_deref()),
         integrity: None,
         bypass: false,
         publish_date: None,
@@ -1371,7 +1569,7 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
     let result = engine.evaluate(&request);
     println!(
         "Package: {}:{}@{}",
-        registry_str,
+        registry.as_str(),
         name,
         version.as_deref().unwrap_or("*")
     );
@@ -1382,6 +1580,136 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
     );
     if result.audited {
         println!("Mode: AUDIT (would block but logs only)");
+    }
+}
+
+#[cfg(test)]
+mod explain_spec_tests {
+    use super::*;
+
+    #[test]
+    fn parse_explain_spec_recovers_each_registrys_at_convention() {
+        let cases: &[(&str, RegistryType, &str, Option<&str>)] = &[
+            (
+                "cargo:serde@1.0.0",
+                RegistryType::Cargo,
+                "serde",
+                Some("1.0.0"),
+            ),
+            (
+                "npm:is-number@7.0.0",
+                RegistryType::Npm,
+                "is-number",
+                Some("7.0.0"),
+            ),
+            // an '@' that starts the name opens an npm scope, not a version
+            (
+                "npm:@scope/pkg@1.0.0",
+                RegistryType::Npm,
+                "@scope/pkg",
+                Some("1.0.0"),
+            ),
+            ("npm:@scope/pkg", RegistryType::Npm, "@scope/pkg", None),
+            (
+                "docker:library/nginx@sha256:abc",
+                RegistryType::Docker,
+                "library/nginx",
+                Some("sha256:abc"),
+            ),
+            // #1099 D1: a raw path with '@' and no version must NOT split on the '@'
+            // — otherwise the hint explains a different package than the one refused.
+            ("raw:dir/a@b.txt", RegistryType::Raw, "dir/a@b.txt", None),
+            ("raw:path/to/file", RegistryType::Raw, "path/to/file", None),
+            ("gems:rails", RegistryType::Gems, "rails", None),
+        ];
+        for (spec, reg, name, ver) in cases {
+            match parse_explain_spec(spec) {
+                ExplainSpec::Parsed {
+                    registry,
+                    name: n,
+                    version: v,
+                } => assert_eq!(
+                    (registry, n.as_str(), v.as_deref()),
+                    (*reg, *name, *ver),
+                    "spec={spec}"
+                ),
+                other => panic!("spec={spec}: expected Parsed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_explain_spec_flags_malformed_specs() {
+        assert_eq!(parse_explain_spec("no-colon-here"), ExplainSpec::NoColon);
+        match parse_explain_spec("bogusreg:thing") {
+            ExplainSpec::UnknownRegistry(r) => assert_eq!(r, "bogusreg"),
+            other => panic!("expected UnknownRegistry, got {other:?}"),
+        }
+    }
+
+    /// Reverse of `shell_word`: a single-quoted token back to its contents, a bare
+    /// token unchanged — what a shell does before `nora curation explain` runs.
+    fn shell_unquote(word: &str) -> String {
+        match word.strip_prefix('\'').and_then(|w| w.strip_suffix('\'')) {
+            Some(inner) => inner.replace(r"'\''", "'"),
+            None => word.to_string(),
+        }
+    }
+
+    /// #1099: the hint explains the package it NAMES, and its spec is
+    /// one shell word so pasting it is safe. For each registry over a corpus —
+    /// single-letter names (`@` at index 1), npm scopes, raw paths with `@`, and
+    /// shell metacharacters in the name AND in the version — the spec the shell
+    /// hands back parses to the same registry/name/version, and the spec is one
+    /// shell word (bare safe chars, or a single-quoted token).
+    #[test]
+    fn explain_command_round_trips_and_is_one_shell_word() {
+        let cases: &[(RegistryType, &str, Option<&str>)] = &[
+            (RegistryType::Npm, "q", Some("1.5.1")), // single-letter: '@' at index 1 (H3)
+            (RegistryType::Npm, "@scope/pkg", Some("1.0.0")),
+            (RegistryType::Cargo, "serde", Some("1.0.0")),
+            (
+                RegistryType::Docker,
+                "library/nginx",
+                Some("sha256:0123abcd"),
+            ),
+            (RegistryType::Raw, "dir/a@b.txt", None), // raw path with '@', no version
+            (RegistryType::Raw, "dir/my file.txt", None),
+            (RegistryType::Npm, "is-number", Some("7.0.0$(touch x)")), // metachar version (H9)
+            (RegistryType::Npm, "is-number", Some("7.0.0;id")),
+            (RegistryType::Raw, "a`id`b", None), // metachar name
+        ];
+        for &(rt, name, version) in cases {
+            let hint = crate::curation::explain_command(rt.as_str(), name, version);
+            let spec = hint
+                .strip_prefix("nora curation explain ")
+                .expect("hint shape");
+            // One shell word: bare safe chars, or a single-quoted token. A version
+            // with a metacharacter must land INSIDE the quotes (H9), not after.
+            let bare_safe = !spec.is_empty()
+                && spec
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c));
+            let quoted = spec.len() >= 2 && spec.starts_with('\'') && spec.ends_with('\'');
+            assert!(
+                bare_safe || quoted,
+                "spec is not one shell word: {spec:?} ({}:{name})",
+                rt.as_str()
+            );
+            match parse_explain_spec(&shell_unquote(spec)) {
+                ExplainSpec::Parsed {
+                    registry,
+                    name: n,
+                    version: v,
+                } => assert_eq!(
+                    (registry, n.as_str(), v.as_deref()),
+                    (rt, name, version),
+                    "round-trip for {}:{name}",
+                    rt.as_str()
+                ),
+                other => panic!("{}:{name}: expected Parsed, got {other:?}", rt.as_str()),
+            }
+        }
     }
 }
 
@@ -1406,12 +1734,17 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(fmt::layer().json().with_target(true))
                 .with(
                     fmt::layer()
                         .json()
                         .with_target(true)
-                        .with_writer(non_blocking)
+                        .with_writer(RedactUserinfo(std::io::stdout)),
+                )
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_writer(RedactUserinfo(non_blocking))
                         .with_filter(file_filter),
                 )
                 .init();
@@ -1420,7 +1753,12 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
         (true, None) => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(fmt::layer().json().with_target(true))
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_writer(RedactUserinfo(std::io::stdout)),
+                )
                 .init();
             None
         }
@@ -1429,11 +1767,15 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(fmt::layer().with_target(false))
                 .with(
                     fmt::layer()
                         .with_target(false)
-                        .with_writer(non_blocking)
+                        .with_writer(RedactUserinfo(std::io::stdout)),
+                )
+                .with(
+                    fmt::layer()
+                        .with_target(false)
+                        .with_writer(RedactUserinfo(non_blocking))
                         .with_filter(file_filter),
                 )
                 .init();
@@ -1442,7 +1784,11 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
         (false, None) => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(fmt::layer().with_target(false))
+                .with(
+                    fmt::layer()
+                        .with_target(false)
+                        .with_writer(RedactUserinfo(std::io::stdout)),
+                )
                 .init();
             None
         }
@@ -1488,6 +1834,156 @@ fn open_log_file(
     Some((non_blocking, guard))
 }
 
+/// Auth routes behind the auth and general limiters, registry routes behind the upload limiter,
+/// each limiter built for its quota. Returns the quotas the built limiters enforce, read back
+/// from them, for the startup log.
+fn rate_limited_routes<S: Clone + Send + Sync + 'static>(
+    auth_routes: Router<S>,
+    registry_routes: Router<S>,
+    quotas: &rate_limit::LimiterQuotas,
+    trusted_proxies: config::TrustedProxies,
+) -> (Router<S>, rate_limit::LimiterQuotas) {
+    let (auth_limiter, auth) = rate_limit::auth_rate_limiter(quotas.auth, trusted_proxies.clone());
+    let (upload_limiter, upload) =
+        rate_limit::upload_rate_limiter(quotas.upload, trusted_proxies.clone());
+    let (general_limiter, general) =
+        rate_limit::general_rate_limiter(quotas.general, trusted_proxies);
+
+    // Auth routes: auth_limiter (strict 1rps) + general_limiter
+    let auth_routes = auth_routes.layer(auth_limiter).layer(general_limiter);
+    // Registry routes: upload_limiter only (200rps/500burst)
+    // No general_limiter — avoids double-limiting that causes 429
+    // during cache warming (dotnet restore with many packages)
+    let limited_registry = registry_routes.layer(upload_limiter);
+
+    let enforced = rate_limit::LimiterQuotas {
+        auth,
+        upload,
+        general,
+    };
+    (
+        Router::new().merge(auth_routes).merge(limited_registry),
+        enforced,
+    )
+}
+
+#[cfg(test)]
+mod rate_limited_routes_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    async fn statuses(app: &Router, path: &str, count: usize) -> Vec<u16> {
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let mut req = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    4000,
+                ))));
+            out.push(app.clone().oneshot(req).await.unwrap().status().as_u16());
+        }
+        out
+    }
+
+    // Registry routes are limited by the upload_* settings and only by
+    // them; auth routes by auth_* and general_*. Bursts differ (auth 1, upload 2, general 3), one
+    // request a second, so the first refusal tells which limiter answered.
+    #[tokio::test]
+    async fn registry_routes_use_the_upload_limiter_only() {
+        let rl = config::RateLimitConfig {
+            enabled: true,
+            auth_rps: 1,
+            auth_burst: 1,
+            upload_rps: 1,
+            upload_burst: 2,
+            general_rps: 1,
+            general_burst: 3,
+        };
+        let auth = Router::new().route("/api/tokens", axum::routing::get(|| async { "ok" }));
+        let registry = Router::new().route("/v2/", axum::routing::get(|| async { "ok" }));
+        let quotas = rate_limit::limiter_quotas(&rl);
+        let (app, enforced) = rate_limited_routes(
+            auth,
+            registry,
+            &quotas,
+            config::TrustedProxies::default_loopback(),
+        );
+        assert_eq!(enforced, quotas);
+        assert_eq!(
+            statuses(&app, "/v2/", 4).await,
+            vec![200, 200, 429, 429],
+            "registry"
+        );
+        assert_eq!(
+            statuses(&app, "/api/tokens", 2).await,
+            vec![200, 429],
+            "auth"
+        );
+
+        // The general limiter stricter than the upload one must not reach registry routes.
+        let rl = config::RateLimitConfig {
+            auth_burst: 2,
+            upload_burst: 3,
+            general_burst: 1,
+            ..rl
+        };
+        let auth = Router::new().route("/api/tokens", axum::routing::get(|| async { "ok" }));
+        let registry = Router::new().route("/v2/", axum::routing::get(|| async { "ok" }));
+        let quotas = rate_limit::limiter_quotas(&rl);
+        let (app, enforced) = rate_limited_routes(
+            auth,
+            registry,
+            &quotas,
+            config::TrustedProxies::default_loopback(),
+        );
+        assert_eq!(enforced, quotas);
+        assert_eq!(
+            statuses(&app, "/v2/", 4).await,
+            vec![200, 200, 200, 429],
+            "registry"
+        );
+        assert_eq!(
+            statuses(&app, "/api/tokens", 2).await,
+            vec![200, 429],
+            "auth"
+        );
+    }
+
+    // Whatever the rates, the routes are built with the quotas they are given, each from its
+    // own setting: rates far apart and far above 1000/s, bursts above u16::MAX.
+    #[test]
+    fn the_routes_enforce_the_quotas_they_are_given() {
+        for (auth, upload, general) in [
+            (1_500_000, 5_000_000, 3),
+            ((1 << 32) + 200, 7, u64::MAX),
+            (999, 1_000_001, 600),
+        ] {
+            let rl = config::RateLimitConfig {
+                enabled: true,
+                auth_rps: auth,
+                auth_burst: 70_000,
+                upload_rps: upload,
+                upload_burst: 100_000,
+                general_rps: general,
+                general_burst: 65_536,
+            };
+            let quotas = rate_limit::limiter_quotas(&rl);
+            let (_, enforced) = rate_limited_routes::<()>(
+                Router::new(),
+                Router::new(),
+                &quotas,
+                config::TrustedProxies::default_loopback(),
+            );
+            assert_eq!(enforced, quotas, "{auth} {upload} {general}");
+        }
+    }
+}
+
 async fn run_server(mut config: Config, storage: Storage) {
     let start_time = Instant::now();
 
@@ -1514,10 +2010,11 @@ async fn run_server(mut config: Config, storage: Storage) {
             None if config.auth.oidc.is_active() => {
                 // #996 — OIDC-only is the intended setup; a missing htpasswd is
                 // not a misconfiguration, so log at info rather than a warning
-                // that trains operators to ignore auth warnings.
+                // that trains operators to ignore auth warnings. Basic still
+                // takes API tokens as the password (#1094).
                 info!(
                     oidc_providers = config.auth.oidc.providers.len(),
-                    "Basic auth disabled (no htpasswd); OIDC is the write path"
+                    "No htpasswd (OIDC-only): Basic auth accepts API tokens only"
                 );
                 None
             }
@@ -1592,9 +2089,17 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Build curation engine (shared helper, also used by SIGHUP reload).
     // Fail-closed: in enforce mode an unparsable filter aborts boot rather
-    // than starting in a silent allow-all state (#586).
-    let curation_engine = build_curation_engine(&config)
-        .unwrap_or_else(|e| panic!("Cannot start in enforce mode: {e}"));
+    // than starting in a silent allow-all state (#586) — with EXIT_CONFIG, a
+    // clean stop the units do not restart into, as for any other configuration
+    // NORA cannot start with (#1025).
+    let curation_engine = match build_curation_engine(&config) {
+        Ok(engine) => engine,
+        Err(e) => {
+            error!(error = %e, "Cannot start in enforce mode");
+            eprintln!("nora: cannot start in enforce mode: {e}");
+            std::process::exit(config::EXIT_CONFIG);
+        }
+    };
     if curation_engine.is_active() {
         info!(
             mode = %config.curation.mode,
@@ -1665,22 +2170,24 @@ async fn run_server(mut config: Config, storage: Storage) {
         .merge(openapi::routes());
 
     let app_routes = if rate_limit_enabled {
-        // Create rate limiters before moving config to state
-        let auth_limiter =
-            rate_limit::auth_rate_limiter(&config.rate_limit, config.auth.trusted_proxies.clone());
-        let upload_limiter = rate_limit::upload_rate_limiter(&config.rate_limit);
-        let general_limiter = rate_limit::general_rate_limiter(&config.rate_limit);
-
-        // Auth routes: auth_limiter (strict 1rps) + general_limiter
-        let auth_routes = auth::token_routes()
-            .layer(auth_limiter)
-            .layer(general_limiter);
-        // Registry routes: upload_limiter only (200rps/500burst)
-        // No general_limiter — avoids double-limiting that causes 429
-        // during cache warming (dotnet restore with many packages)
-        let limited_registry = registry_routes.layer(upload_limiter);
-
-        Router::new().merge(auth_routes).merge(limited_registry)
+        let (routes, enforced) = rate_limited_routes(
+            auth::token_routes(),
+            registry_routes,
+            &rate_limit::limiter_quotas(&config.rate_limit),
+            config.auth.trusted_proxies.clone(),
+        );
+        // What the built limiters enforce, read back from them: any narrowing between the
+        // configuration and the limiters shows here, next to "Rate limiting configured".
+        info!(
+            auth_rps = enforced.auth.per_second(),
+            auth_burst = enforced.auth.burst,
+            upload_rps = enforced.upload.per_second(),
+            upload_burst = enforced.upload.burst,
+            general_rps = enforced.general.per_second(),
+            general_burst = enforced.general.burst,
+            "Rate limits enforced"
+        );
+        routes
     } else {
         info!("Rate limiting DISABLED");
         Router::new()
@@ -1755,11 +2262,13 @@ async fn run_server(mut config: Config, storage: Storage) {
         signer,
         leak_finders,
         cancel_token: cancel_token.clone(),
+        pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
     };
 
-    // Initialize circuit breaker gauge to 0 (Closed) for all registries (#441)
-    let registry_names: Vec<&str> = RegistryType::all().iter().map(|rt| rt.as_str()).collect();
-    state.circuit_breaker.init_gauges(&registry_names);
+    // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
+    let breaker_keys = circuit_breaker::initial_gauge_keys(&state.config);
+    let breaker_keys: Vec<&str> = breaker_keys.iter().map(String::as_str).collect();
+    state.circuit_breaker.init_gauges(&breaker_keys);
 
     // Shared lock: nothing that calls storage.delete may run concurrently.
     // The periodic cleanup cycle takes it once per cycle and runs every due
@@ -1768,6 +2277,15 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let mut scheduler_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // #1114: fold accumulated docker pull counts into their .stats.json sidecars
+    // every PULL_STATS_FLUSH_INTERVAL and once more on shutdown. Pushed to the
+    // scheduler handles so the final flush completes within the shutdown drain,
+    // keeping the stats loss to at most one interval only on a hard crash.
+    scheduler_handles.push(tokio::spawn(registry::docker::pull_stats_flush_loop(
+        state.clone(),
+        registry::docker::PULL_STATS_FLUSH_INTERVAL,
+    )));
 
     // Retention is pushed first: it deletes expired versions, creating the
     // orphans the GC pass then sweeps in the same cycle.
@@ -1836,7 +2354,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let publish_locks = state.publish_locks.clone();
         let dry_run = state.config.gc.dry_run;
         let grace_secs = state.config.gc.grace_secs;
-        let npm_is_proxy = state.config.npm.proxy.is_some();
+        let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
         let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
         cleanup_passes.push(cleanup::CleanupPass {
             name: "gc",
@@ -1880,57 +2398,39 @@ async fn run_server(mut config: Config, storage: Storage) {
         .merge(admin::routes())
         .layer(DefaultBodyLimit::max(
             state.config.server.body_limit_mb * 1024 * 1024,
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("x-content-type-options"),
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("x-frame-options"),
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("referrer-policy"),
-            HeaderValue::from_static("strict-origin-when-cross-origin"),
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("content-security-policy"),
-            HeaderValue::from_static("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'"),
-        ))
-        // Middleware layer order — LOAD-BEARING, do not reorder (#542).
-        //
-        // In axum, last .layer() = outermost (runs first). Execution order:
-        //   reject_null_bytes → metrics → auth → leak_detection → request_id → handler
-        //
-        // reject_null_bytes MUST be outermost to block null-byte path attacks
-        // before any processing occurs.
-        // metrics MUST be next-outermost so it counts ALL responses including
-        // auth rejections (401/403/429) in nora_http_requests_total.
-        // request_id is innermost so the ID is available to handlers.
-        .layer(middleware::from_fn(request_id::request_id_middleware))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            metrics::leak_detection_middleware,
-        ))
-        // Prefix the UI's root-absolute self-links + redirects with the public_url
-        // path so the UI works under a sub-path behind a proxy. No-op when unset;
-        // only buffers text/html (UI pages), so blob streams pass through untouched.
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            ui::rewrite_ui_base_path,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::auth_middleware,
-        ))
+        ));
+    let app = apply_security_headers(app);
+    // Middleware layer order — LOAD-BEARING, do not reorder (#542).
+    //
+    // In axum, last .layer() = outermost (runs first). Execution order:
+    //   reject_null_bytes → metrics → [request_layers: auth → rewrite_ui_base_path
+    //   → leak_detection → request_id → curation_refusal (audit)] → handler
+    //
+    // reject_null_bytes MUST be outermost to block null-byte path attacks
+    // before any processing occurs.
+    // metrics MUST be next-outermost so it counts ALL responses including
+    // auth rejections (401/403/429) in nora_http_requests_total.
+    // The layers inside metrics are built by `request_layers`, which the test
+    // router uses too, so the tests run the order the server runs.
+    let app = request_layers(app, &state)
         .layer(middleware::from_fn(metrics::metrics_middleware))
-        .layer(middleware::from_fn(validation::reject_null_bytes_middleware))
+        .layer(middleware::from_fn(
+            validation::reject_null_bytes_middleware,
+        ))
         .with_state(state.clone());
+
+    // Open this instance's staging directory, removing what dead instances (SIGKILL,
+    // OOM, power cut) left in theirs.
+    state.storage.prepare().await;
 
     // Clean up stale Docker temp files from previous runs (#530, #580).
     if state.config.docker.enabled {
         registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
         registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
+    }
+    // ...and streamed raw uploads a crash cut off mid-request.
+    if state.config.raw.enabled {
+        registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
     }
 
     let listener = bind_listener(&state.config.server.host, state.config.server.port)
@@ -2025,6 +2525,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                     // survive on disk until the next boot. Age-guarded by SESSION_TTL,
                     // so in-progress uploads are never reaped.
                     registry::docker::cleanup_upload_temp_dir(&storage_path);
+                    registry::raw::cleanup_upload_temp_dir(&storage_path);
                 });
             }
         }
@@ -2445,5 +2946,51 @@ mod curation_reload_tests {
 
         let config = config_with_allowlist(CurationMode::Off, path.to_str().unwrap().into());
         assert!(build_curation_engine(&config).is_ok());
+    }
+}
+
+/// the production stack is `request_layers` plus exactly metrics and
+/// reject_null_bytes outside it (white list), and the test router builds its layers only
+/// through `request_layers`. Needles are built at run time so this text does not match.
+#[cfg(test)]
+mod middleware_stack_whitelist {
+    fn squash(s: &str) -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn the_server_stack_is_request_layers_plus_metrics_and_null_bytes() {
+        let code = squash(include_str!("main.rs"));
+        let fn_start = ["async", "fnrun_server("].concat();
+        let body = &code[code.find(&fn_start).expect("run_server")..];
+        let start = ["letapp=request_layers", "(app,&state)"].concat();
+        let at = body
+            .find(&start)
+            .expect("run_server must build its stack with request_layers");
+        let tail = &body[at..];
+        let end = tail.find(".with_state(state.clone());").unwrap();
+        let expected = [
+            "letapp=request_layers(app,&state)",
+            ".layer(middleware::from_fn(metrics::metrics_middleware))",
+            ".layer(middleware::from_fn(validation::reject_null_bytes_middleware,))",
+        ]
+        .concat();
+        assert_eq!(&tail[..end], expected);
+    }
+
+    #[test]
+    fn the_test_router_builds_its_layers_only_through_request_layers() {
+        let code = squash(include_str!("test_helpers.rs"));
+        assert!(code.contains(&["crate::request_layers", "(routes,&state)"].concat()));
+        assert_eq!(code.matches(&["from_fn", ""].concat()).count(), 0);
+        assert_eq!(
+            code.matches(&[".layer", "("].concat()).count(),
+            1,
+            "only DefaultBodyLimit"
+        );
     }
 }

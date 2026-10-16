@@ -36,6 +36,8 @@ hex.workspace = true
 object_store = { version = "0.13", features = ["aws", "gcp"] }
 futures = "0.3"
 toml = "1.1"
+# Lists config keys no field reads, so a typo is reported instead of ignored.
+serde_ignored = "0.1"
 uuid = { version = "1", features = ["v4"] }
 bcrypt = "0.19"
 base64 = "0.22"
@@ -65,9 +67,19 @@ socket2 = "0.6"
 rpm = { version = "0.25", default-features = false }
 ar = "0.9"
 lzma-rs = "0.3"
-ruzstd = "0.8"
+ruzstd = "0.9"
 pgp = { version = "0.20", default-features = false }
 rand = "0.8"
+# mimalloc as the global allocator (feature `mimalloc`, on by default). The static musl build
+# uses musl's mallocng, which takes one global lock per allocation and collapses into kernel
+# futex contention under many async workers; mimalloc's per-thread heaps remove it. The `no_thp`
+# feature keeps idle/after-load RSS small and OS-returnable (default THP huge pages inflate it).
+mimalloc = { version = "0.1", features = ["no_thp"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# flock(2) on the local backend's staging lock, without unsafe; already in the tree
+# through tempfile.
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
 # Tests build real .rpm fixtures; payload+gzip stay out of the release binary.
@@ -91,4 +103,8 @@ workspace = true
 ignored = ["md-5"]
 
 [features]
+default = ["mimalloc"]
+# Global allocator (see the `mimalloc` dependency). Build `--no-default-features` for the
+# system allocator (musl's malloc on the static build).
+mimalloc = ["dep:mimalloc"]
 demo = []
